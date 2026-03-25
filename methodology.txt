@@ -1,0 +1,565 @@
+VIX DECOMPOSITION RESEARCH FRAMEWORK
+Steps 1–4: Methodology Reference
+================================================================================
+
+WHAT THIS PROJECT IS
+--------------------------------------------------------------------------------
+The CBOE VIX Index measures the market's expectation of 30-day implied
+volatility for the S&P 500 (SPX).  Each day, VIX moves because option traders
+repriced the market — but WHY did it move?  Was it a broad shift in fear (all
+strikes repriced), or was it specifically put buyers pricing in crash risk
+(downside skew), or something else?
+
+This framework answers that question by decomposing the daily change in VIX
+(ΔVIX) into structural components:
+
+    ΔVIX = sticky + parallel + put_skew + call_skew
+                             + put_convexity + call_convexity
+                             + higher_order
+
+These components are then used to generate trading signals.
+
+The data used is S&P 500 (SPX) end-of-day options data from Cboe/LiveVol,
+currently covering Q4 2023 (October–December 2023, 63 trading days).
+
+The pipeline runs in sequential steps, each feeding the next:
+
+    Step 1: Raw data ingestion
+    Step 2: Implied-volatility surfaces
+    Step 3: VIX reconstruction from first principles
+    Step 4: VIX decomposition into structural components
+
+
+================================================================================
+BACKGROUND: KEY CONCEPTS
+================================================================================
+
+WHAT IS AN OPTION?
+An option is a contract giving its holder the right (but not the obligation) to
+buy or sell the S&P 500 at a fixed price (the "strike") on a fixed future date
+(the "expiration").  A call option benefits from the market going up; a put
+option benefits from the market going down.
+
+WHAT IS IMPLIED VOLATILITY (IV)?
+Options are priced partly on how uncertain the future is.  Given an observed
+option price and the current index level, the Black-Scholes model can back out
+the "implied volatility" — the annualised volatility of returns that, if
+constant, would produce that price.  IV is quoted as a decimal: 0.15 = 15% p.a.
+
+WHAT IS THE VOLATILITY SMILE/SURFACE?
+Across different strikes on the same day, IV is not flat.  Put options with low
+strikes (crash protection) tend to have higher IV than ATM calls — this is
+called the "volatility skew" or "smile."  Plotting IV against strike gives the
+IV smile for one expiration; plotting it against both strike and expiration
+gives the IV surface.
+
+WHAT IS THE VIX?
+The VIX is NOT derived from a model.  Instead, the CBOE uses a "model-free"
+formula that integrates the prices of ALL available options across strikes, which
+is mathematically equivalent to the market's expected variance over the next 30
+calendar days.  VIX is the square root of that, multiplied by 100 and expressed
+as a percentage.  VIX = 15 means the market expects 15% annualised volatility
+over the next 30 days.
+
+
+================================================================================
+STEP 1: DATA INGESTION
+================================================================================
+
+PURPOSE
+-------
+Load raw SPX options data from Cboe/LiveVol files, clean it, filter it to the
+relevant maturities, and persist it as a fast-access parquet cache.  Also
+download SPX and VIX daily closing prices from Yahoo Finance.
+
+INPUT
+-----
+Raw data files: text files in Cboe/LiveVol "wide" format.  Each file contains
+one trading quarter of end-of-day SPX option data.  The format is wide: each
+row represents a (date, expiration, strike) triple and contains BOTH the call
+and put fields side-by-side.
+
+Key raw columns (all wrapped in square brackets in the file headers):
+    [QUOTE_DATE]       — the trading date, e.g. 2023-10-03
+    [EXPIRE_DATE]      — the option expiration date
+    [DTE]              — calendar days from quote date to expiration
+    [STRIKE]           — the option strike price (e.g. 4300)
+    [UNDERLYING_LAST]  — the S&P 500 close price on that day
+    [C_IV]             — call implied volatility (annualised decimal, e.g. 0.15)
+    [C_BID], [C_ASK]   — call best bid and ask prices
+    [P_IV]             — put implied volatility
+    [P_BID], [P_ASK]   — put best bid and ask prices
+
+WHAT THE CODE DOES
+------------------
+1. Scan the raw data directory for all txt files.
+
+2. Read each file with pandas, stripping the square-bracket formatting from
+   column headers.
+
+3. Melt the wide format into a long format: instead of one row with both call
+   and put columns, produce two rows per (date, expiration, strike):
+       one row with option_type = 'C'  (the call)
+       one row with option_type = 'P'  (the put)
+
+4. Filter to the VIX maturity window: only options with DTE between 23 and 37
+   calendar days are kept.  CBOE uses 23–37 DTE because VIX targets 30 days and
+   this window ensures both a near-term and a next-term expiration always exist.
+
+5. Apply data quality filters:
+   - Drop rows where IV is below 0.001 (essentially zero, often a data error).
+   - Drop rows where IV is above 5.0 (500%, clearly erroneous).
+   - Drop rows where the bid price is below $0.05 (too illiquid to trust).
+   - Drop rows where the bid-ask spread exceeds 50% of the mid-quote (too wide).
+   - Require at least 20 strikes per (date, expiration) pair to be usable.
+
+6. Compute the mid-quote price: mid = (bid + ask) / 2.
+
+7. Download SPX (^GSPC) and VIX (^VIX) daily closes from Yahoo Finance using
+   the yfinance library for the same date range.
+
+8. Cache both datasets as Apache Parquet files for fast access in subsequent
+   steps.  The parquet cache is invalidated by a --refresh flag.
+
+KEY DESIGN CHOICE: WHY FILTER TO 23–37 DTE?
+--------------------------------------------
+The VIX formula requires two expirations that straddle 30 calendar days.  By
+restricting to 23–37 DTE, we always have at least one expiration below 30 and
+one at or above 30.  Expirations outside this window are irrelevant to VIX and
+would waste memory.
+
+VALIDATION RESULTS (Q4 2023)
+-----------------------------
+    Trading days loaded    : 63  (2023-10-02 to 2023-12-29)
+    Options rows (clean)   : 122,409
+    Strike range           : 400 – 5700
+    IV range               : 6.5% – 479%
+    SPX range              : 4117 – 4783
+    VIX range              : 12.1 – 21.7
+    All dates have ≥ 20 strikes per expiration: yes
+
+
+================================================================================
+STEP 2: IMPLIED-VOLATILITY SURFACE CONSTRUCTION
+================================================================================
+
+PURPOSE
+-------
+For each trading day, build a smooth, continuous function IV(K) from the
+discrete set of observed strikes.  This function, called an IVSurface, is
+used in every subsequent step as a compact representation of the full smile.
+
+TWO SURFACES PER DAY
+--------------------
+The CBOE VIX formula requires two specific expirations per day:
+
+    Near-term (T₁): the expiration closest to 30 DTE from BELOW (< 30 days)
+    Next-term (T₂): the expiration closest to 30 DTE from ABOVE (≥ 30 days)
+
+Each gets its own IVSurface.  When the shortest available DTE is already ≥ 30,
+both surfaces use the same expiration (edge case handled cleanly).
+
+STEP 1: FORWARD PRICE FROM PUT-CALL PARITY
+-------------------------------------------
+The forward price F is the market's expected index level at expiration.  It is
+NOT simply the current index level; it differs because of dividends and
+financing cost.  We derive F directly from option prices using put-call parity:
+
+    At any strike K, put-call parity states:
+        C(K) - P(K) = e^{-rT} × (F - K)
+
+    In practice, we find K* = the strike where |C(K) - P(K)| is minimised,
+    then compute:
+        F = K* + e^{rT} × (C(K*) - P(K*))
+
+    where r is the risk-free rate (5.3% for Q4 2023) and T = DTE/365.
+
+This gives us the true forward price that is consistent with actual option prices.
+
+STEP 2: REFERENCE STRIKE K₀
+----------------------------
+K₀ is defined as the first strike at or below F.  This is used in the CBOE
+VIX formula to separate puts (K < K₀) from calls (K > K₀) and to apply a
+small correction term.
+
+STEP 3: OTM OPTION SELECTION
+-----------------------------
+For each strike K on a given day:
+    K < K₀  →  use the put IV
+    K > K₀  →  use the call IV
+    K = K₀  →  use the average of call IV and put IV
+
+This "OTM selection" ensures we always use the more liquid, less model-
+sensitive option at each strike.  Deep OTM puts and calls are more informative
+than deep ITM options.
+
+STEP 4: CUBIC SPLINE FITTING
+-----------------------------
+Once we have a clean (strike, IV) dataset for a given (date, expiration), we
+fit a cubic spline:
+
+    - Algorithm: SciPy CubicSpline with bc_type="not-a-knot"
+      (the most common choice; enforces natural continuity at the boundaries)
+    - No smoothing (exact interpolation through all data points)
+    - Extrapolation is strictly forbidden: the surface returns NaN for any
+      strike outside the range [min_observed_strike, max_observed_strike]
+
+WHY CUBIC SPLINE?
+The cubic spline passes exactly through all observed IVs while being smooth
+(continuous first and second derivatives) between observations.  We need smooth
+IVs for the derivative-based quantities used in Step 4 (slope and curvature
+of the smile).  We do NOT extrapolate because market prices outside the
+observed range would be entirely invented.
+
+THE IVSurface OBJECT
+--------------------
+The result is an IVSurface dataclass containing:
+    - The cubic spline (callable: surface(K) → IV)
+    - The strike array, IV array
+    - K₀, forward price F, T (time to expiry in years), DTE
+    - Min and max valid strikes
+
+VALIDATION RESULTS (Q4 2023)
+-----------------------------
+    Groups processed : 614  (date × expiration pairs)
+    Successful fits  : 610  (4 had <5 OTM call strikes and were skipped)
+    All 63 dates have both near and next surfaces
+    ATM IV range     : 9.4% – 18.2%  (matches VIX range closely)
+    Forward carry    : mean ~0.35% per 29-day period ≈ 4.4% annualised
+                       (consistent with r ≈ 5.3% minus ~1% SPX dividend yield)
+
+
+================================================================================
+STEP 3: VIX RECONSTRUCTION
+================================================================================
+
+PURPOSE
+-------
+Compute a "synthetic" VIX from the options data using the same formula the
+CBOE uses to publish the official VIX.  This serves two purposes:
+    1. Validate that our data and surface construction are correct.
+    2. Produce a clean daily VIX series used as the P&L benchmark in Step 6.
+
+THE CBOE FORMULA (PER EXPIRATION)
+-----------------------------------
+For a single expiration T, the CBOE variance formula is:
+
+    σ²(T) = (2/T) × e^{rT} × Σᵢ [ ΔKᵢ/Kᵢ² × Q(Kᵢ) ]  −  (1/T) × (F/K₀ − 1)²
+
+where:
+    Q(Kᵢ) = market mid-quote price of the OTM option at strike Kᵢ
+             (put if Kᵢ < K₀, call if Kᵢ > K₀, average at K₀)
+    ΔKᵢ   = trapezoid-rule strike interval:
+             = (K_{i+1} − K_{i-1}) / 2   for interior strikes
+             = K₁ − K₀  or  Kₙ − K_{n-1}  for edge strikes
+    F      = forward price from Step 2
+    K₀     = first strike at or below F from Step 2
+    T      = DTE / 365 (time to expiry in years)
+    r      = risk-free rate
+
+The first term is a sum of weighted option prices across all available strikes.
+Intuitively, it captures the market's price of variance at every point on the
+smile.  The second term is a small correction for the gap between the forward
+price and the nearest strike.
+
+WHY USE MARKET PRICES, NOT SPLINE IVs?
+The spline from Step 2 is used in Steps 4 and 5, but NOT here.  The CBOE
+formula is "model-free" — it uses the actual observed market prices, not any
+fitted curve.  Using spline-reconstructed prices would reintroduce model
+dependency and add error.  We therefore go back to the raw cleaned data from
+Step 1 and use the actual mid-quotes.
+
+30-DAY INTERPOLATION
+--------------------
+The CBOE formula evaluates σ² at two specific expirations (T₁ near < 30 days,
+T₂ next ≥ 30 days), then interpolates to exactly 30 calendar days:
+
+    σ²₃₀ = [ T₁σ₁²(D₂−30) + T₂σ₂²(30−D₁) ] / (D₂−D₁) × (365/30)
+
+where D₁ and D₂ are the DTEs (in calendar days) of the near and next
+expirations.  This is a time-weighted average of the "total variance" T×σ²
+that scales to a 30-day horizon.
+
+    VIX_synth = 100 × √σ²₃₀
+
+VALIDATION RESULTS (Q4 2023)
+-----------------------------
+    Days compared        : 63
+    Correlation(synth, actual VIX)  : 0.9977   [target > 0.95] ✓
+    Mean absolute error              : 0.254 pts [target < 1.0]  ✓
+    Root mean squared error          : 0.295 pts
+    Bias (synthetic − actual)        : −0.216 pts  (systematic underestimate)
+    Days within ±1 VIX point         : 100%
+
+The small systematic underestimate (about −0.2 pts) is expected: official VIX
+is published at 3:15 PM Chicago time when markets are still open, whereas our
+data is end-of-day.  End-of-day prices are slightly lower on average because
+the intraday fear premium has partially dissipated.
+
+
+================================================================================
+STEP 4: VIX DECOMPOSITION
+================================================================================
+
+PURPOSE
+-------
+Attribute the daily change in VIX to specific structural changes in the
+implied-volatility smile.  We want to answer:
+
+    "VIX moved +1.5 pts today.  How much of that was a general increase in
+     fear (all strikes repriced higher) vs. put buyers specifically buying
+     crash protection (put skew steepened) vs. wings getting priced in
+     (convexity increased)?"
+
+THE DECOMPOSITION IDENTITY
+---------------------------
+The framework decomposes each day's ΔVIX = VIX_t − VIX_{t-1} as:
+
+    ΔVIX  =  sticky_contribution
+           + parallel_contribution
+           + put_skew_contribution
+           + call_skew_contribution
+           + put_convexity_contribution
+           + call_convexity_contribution
+           + higher_order_contribution
+
+These contributions sum to ΔVIX exactly — not approximately.  There is no
+"error" term; the higher_order_contribution captures whatever non-quadratic
+component remains.
+
+KEY CONCEPT: STICKY-STRIKE CONVENTION
+--------------------------------------
+The sticky-strike convention says: when the index moves from level S_{t-1}
+to S_t, the implied volatility at every fixed dollar strike (e.g. K=4300)
+stays unchanged.
+
+In practice, the smile does move — the sticky-strike contribution measures
+what portion of ΔVIX is simply explained by the spot moving to a different
+part of yesterday's smile (like a ball rolling along a fixed curve).
+
+Example: if SPX falls from 4500 to 4400, the new ATM strike (4400) was
+yesterday an OTM put with higher IV.  Even with no "repricing," VIX rises
+because today's ATM is at a higher point on yesterday's skew.
+
+ALGORITHM OVERVIEW
+------------------
+The decomposition proceeds in 8 steps:
+
+1. STICKY-STRIKE BASELINE
+   Map yesterday's IV surface onto today's strike grid using yesterday's
+   spline.  Call this IV_ss(K) — the IV surface today would have IF it
+   were purely sticky-strike.  Compute VIX_ss from these IVs.
+
+       sticky_contribution = VIX_ss − VIX_0
+
+   where VIX_0 is VIX computed from yesterday's surface in yesterday's
+   forward frame.
+
+2. IV CHANGE
+   Compute the actual IV change at each of today's strikes:
+
+       ΔIV_i = IV_t(K_i) − IV_ss(K_i)
+
+   This ΔIV is the "active repricing" — the part of the surface move NOT
+   explained by the sticky-strike convention.
+
+3. POLYNOMIAL PROJECTION (CBOE-WEIGHTED OLS)
+   Decompose ΔIV into a 5-parameter piecewise polynomial:
+
+       Put side   (K ≤ K₀, m ≤ 0):  ΔIV ≈ α + β_put·m  + γ_put·m²
+       Call side  (K > K₀, m > 0):  ΔIV ≈ α + β_call·m + γ_call·m²
+
+   where m = (K − K₀) / K₀ is normalised moneyness.
+
+   The five parameters have clear economic interpretations:
+       α       = uniform level shift across ALL strikes     (parallel move)
+       β_put   = slope change on the put side               (put skew change)
+       β_call  = slope change on the call side              (call skew change)
+       γ_put   = curvature change on the put side           (put convexity change)
+       γ_call  = curvature change on the call side          (call convexity change)
+
+   The fit uses CBOE-integrand weights w_i = ΔK_i / K_i².  This means the
+   polynomial minimises the VIX-relevant IV fitting error (the CBOE formula
+   weight), rather than treating all strikes equally.  Deep OTM far-from-ATM
+   options get lower weight, reflecting their smaller contribution to VIX.
+
+   WHY SHARE α (THE PARALLEL SHIFT)?
+   The put and call sides share the same intercept α.  This is mathematically
+   necessary to ensure the two polynomial pieces meet at K₀ (m=0) and that
+   "parallel" is uniquely defined: a uniform shift of all IVs by the same
+   amount.  Without this constraint, the put and call sides could each have
+   their own intercept, making the "parallel" concept ambiguous.
+
+   WHY SEPARATE PUT AND CALL?
+   The volatility smile is fundamentally asymmetric.  The put wing (downside)
+   is steep and driven by crash risk; the call wing (upside) is much flatter.
+   Using a single β and γ for both sides forces a symmetric shape that doesn't
+   fit well.  Allowing separate β_put/β_call and γ_put/γ_call captures the
+   asymmetry precisely.
+
+4. FIVE INTERMEDIATE IV ARRAYS
+   Apply the polynomial components one at a time to IV_ss:
+
+       IV₁(K) = IV_ss(K) + α                           [parallel applied]
+       IV₂(K) = IV₁(K)  + β_put·m   for K ≤ K₀        [put skew applied]
+       IV₃(K) = IV₂(K)  + β_call·m  for K > K₀        [call skew applied]
+       IV₄(K) = IV₃(K)  + γ_put·m²  for K ≤ K₀        [put convexity applied]
+       IV₅(K) = IV₄(K)  + γ_call·m² for K > K₀        [call convexity applied]
+
+   IV₆ = IV_t (the actual observed IVs today)
+
+   Note: because the put side (K ≤ K₀) and call side (K > K₀) act on
+   completely disjoint sets of strikes, the order in which we apply them
+   makes no difference — the contributions are additive and independent.
+
+5. VIX AT EACH INTERMEDIATE SURFACE
+   Apply the full CBOE formula (with 30-day interpolation) at each IV array:
+
+       VIX_0    = CBOE(IV from yesterday's surface, in yesterday's frame)
+       VIX_ss   = CBOE(IV_ss, in today's frame)
+       VIX_1    = CBOE(IV₁)
+       VIX_2    = CBOE(IV₂)
+       VIX_3    = CBOE(IV₃)
+       VIX_4    = CBOE(IV₄)
+       VIX_5    = CBOE(IV₅)
+       VIX_BS_T = CBOE(IV_t)   ← this equals VIX_synth from Step 3
+
+   "Full CBOE formula" means: convert IVs to Black-Scholes option prices,
+   then apply the CBOE variance integral.  No linearisation is used — every
+   VIX evaluation is the exact nonlinear formula.
+
+6. CONTRIBUTIONS (TELESCOPE EXACTLY)
+   Each contribution is a simple difference between consecutive VIX levels:
+
+       sticky_contribution         = VIX_ss   − VIX_0
+       parallel_contribution       = VIX_1    − VIX_ss
+       put_skew_contribution       = VIX_2    − VIX_1
+       call_skew_contribution      = VIX_3    − VIX_2
+       put_convexity_contribution  = VIX_4    − VIX_3
+       call_convexity_contribution = VIX_5    − VIX_4
+       higher_order_contribution   = VIX_BS_T − VIX_5
+
+   By construction, these sum to exactly:
+       VIX_BS_T − VIX_0 = ΔVIX_synth
+
+   The sum is algebraically exact — no floating-point slop — because each
+   term is defined as a difference that cancels with the next.
+
+7. COMBINED ALIASES (FOR SIGNALS)
+   Two combined quantities are also computed for use in trading signals:
+
+       skew_contribution       = put_skew + call_skew
+       convexity_contribution  = put_convexity + call_convexity
+
+8. TV QUADRATIC FIT (BACKWARD COMPATIBILITY)
+   In addition to the polynomial projection, a total-variance quadratic fit
+   is run on each day's near-term smile:
+
+       w(k) = α + β·k + γ·k²    where w = T·IV², k = ln(K/F)
+
+   The ATM level a_t = √(α/T) is used by the trading signals in Step 5.
+   This fit is NOT part of the decomposition — it is a diagnostic/signal
+   input kept for backward compatibility.
+
+WHAT DOES "HIGHER-ORDER" MEAN?
+-------------------------------
+The polynomial projection can only capture changes that follow a quadratic
+pattern in moneyness (separate for puts and calls).  Any deviation from
+a quadratic IV change — non-symmetric higher-order smile dynamics, fat
+tails, kurtosis changes — ends up in the higher_order_contribution.
+
+This is genuinely informative: a large higher_order term means the smile
+changed in a fundamentally non-quadratic way that day.  A small higher_order
+term (as we typically see) confirms that most of the smile dynamics can be
+summarised by just 5 numbers.
+
+VALIDATION RESULTS (Q4 2023)
+-----------------------------
+    Sum check (max error across all 62 days)  : 0.00e+00   ✓ (exact by construction)
+    Mean |ΔVIX|                               : 0.622 pts
+    Mean explained by quadratic model         : 85.4%  (60 of 62 days with |ΔVIX|≥0.05)
+    Mean |higher_order_contribution|          : 0.043 pts
+    Days with |higher_order| ≤ 0.5 pts        : 100%
+    Median R² of TV quadratic fit             : 0.9986
+
+    Component absolute means (average magnitudes across all days):
+        sticky_contribution         : 0.525 pts  — largest; spot drift dominates
+        parallel_contribution       : 0.455 pts  — broad fear/calm shifts
+        put_skew_contribution       : 0.369 pts  — downside crash-protection demand
+        call_skew_contribution      : 0.192 pts  — upside call demand/supply
+        put_convexity_contribution  : 0.160 pts  — tail curvature (put side)
+        call_convexity_contribution : 0.073 pts  — tail curvature (call side)
+        higher_order_contribution   : 0.043 pts  — residual non-quadratic shape
+
+EXAMPLE INTERPRETATION (2023-10-13, ΔVIX = +2.13 pts)
+-------------------------------------------------------
+On this day VIX rose about 2.1 pts.  The decomposition shows:
+
+    sticky         = +0.44   (spot fell, moved onto higher-IV part of smile)
+    parallel       = −0.47   (broad repricing slightly LOWER — unusual)
+    put_skew       = +2.81   (put skew sharply steeper — crash fear)
+    call_skew      = +0.74   (calls also bid up)
+    put_convexity  = −1.28   (put curvature fell — tail priced less relative)
+    call_convexity = −0.39   (call curvature fell)
+    higher_order   = +0.28
+
+Interpretation: the rise was almost entirely a redistribution within the
+smile — put skew steepened (crash protection became expensive) while overall
+curvature fell.  The broad parallel shift was actually modestly negative (calm
+at ATM), but the redistribution to OTM puts dominated.
+
+
+================================================================================
+HOW THE STEPS CONNECT
+================================================================================
+
+    Step 1 outputs:
+        options DataFrame (long format, 23–37 DTE, cleaned)
+        market DataFrame (SPX + VIX daily closes)
+        Both cached as parquet files
+
+    Step 2 uses: options DataFrame (IVs for spline fitting)
+    Step 2 outputs:
+        surfaces dict: {date → {'near': IVSurface, 'next': IVSurface}}
+
+    Step 3 uses: options DataFrame (market prices for CBOE formula)
+                 surfaces dict (for K₀, F, T, DTE reference values)
+    Step 3 outputs:
+        vix_synth: pd.Series of synthetic VIX by date
+
+    Step 4 uses: surfaces dict (splines for sticky-strike baseline)
+                 vix_synth (as the target ΔVIX to decompose)
+    Step 4 outputs:
+        decomp DataFrame: 62 rows × ~30 columns
+        One row per day (day 1 has no predecessor so no decomposition)
+        Columns: ΔVIX, sticky/parallel/put_skew/call_skew/put_conv/call_conv/
+                 higher_order contributions, model_total, residual, TV params
+
+
+================================================================================
+FILES AND CONFIGURATION
+================================================================================
+
+Source code:
+    src/data_ingestion.py   — Step 1
+    src/iv_surface.py       — Step 2
+    src/vix_reconstruction.py — Step 3
+    src/vix_decomposition.py  — Step 4
+
+Configuration (config.py — all tunable parameters):
+    MIN_DTE = 23, MAX_DTE = 37           — maturity window
+    RISK_FREE_RATE = 0.053               — used in forward price and VIX formula
+    QUADRATIC_WINDOW_PCT = 0.15          — ±15% ATM window for TV fit only
+    BUMP_IV_FLOOR = 0.001                — floor on perturbed IVs
+    MIN_STRIKES_REQUIRED = 20            — minimum strikes per expiration
+    DEFAULT_START_DATE / END_DATE        — date range (currently Q4 2023)
+
+Running:
+    python main.py --step 4              — run steps 1 through 4
+    python main.py --step 7              — run the full pipeline
+    python main.py --step 4 --refresh   — force re-parse of raw data
+
+
+================================================================================
+END OF DOCUMENT
+================================================================================

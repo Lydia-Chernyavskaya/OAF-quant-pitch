@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Data (large files, not for git)
+data/
+SPX data/
+
+# OS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
