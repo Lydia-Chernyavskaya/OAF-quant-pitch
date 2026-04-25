@@ -23,62 +23,6 @@ import scipy.stats as _ss  # _ss.norm used throughout; always available before a
 norm = _ss.norm  # module-level alias so functions can use norm directly
 
 
-
-# =============================================================================
-# FACTOR GENERATION & HELPER FUNCTIONS
-# -------------------------------------------------------------------
-# Factor generation (6-factor VIX decomposition):
-#   run_decomposition()           → F1-F6 computation
-#   find_strike_for_delta()        → F3-F6: delta-to-strike conversion
-#   _delta_func()                  → objective for find_strike_for_delta()
-#
-# Skew & interpolation helpers:
-#   build_30day_skew()            → 30d interpolated put/call skew surface
-#   get_vol_at_strike()            → cubic spline vol interpolation from skew dict
-#
-# IV & VIX helpers:
-#   bs_iv()                        → Black-Scholes implied vol (brentq)
-#   _bs_call(), _bs_put()          → Black-Scholes price formulas
-#   compute_vix_variance()         → CBOE variance for one expiry (with zero-bid truncation)
-#   compute_forward()              → forward price via put-call parity
-#   build_chain_df()              → raw optionchain → DataFrame with mids
-#   find_nearest_expiries()       → near/far expiry selection (DTE <= 30 / > 30)
-# =============================================================================
-
-# CONFIG
-def load_env():
-    # .env is in the parent of the VIX-project directory
-    path = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env")
-    vars_ = {}
-    with open(path) as f:
-        for line in f:
-            line = line.strip()
-            if "=" in line and not line.startswith("#"):
-                k, v = line.split("=", 1)
-                vars_[k.strip()] = v.strip()
-    return vars_
-
-ENV = load_env()
-SUPABASE_URL = ENV["SUPABASE_URL"]
-SUPABASE_KEY = ENV["SUPABASE_SERVICE_KEY"]
-
-def fetch_snapshots_2026():
-    """Fetch PM snapshots for dates >= 2026-01-01 from Supabase."""
-    url = f"{SUPABASE_URL}/rest/v1/market_snapshots"
-    headers = {
-        "apikey": SUPABASE_KEY,
-        "Authorization": f"Bearer {SUPABASE_KEY}",
-    }
-    params = {
-        "select": "date,period,payload",
-        "date": "gte.2026-01-01",
-        "period": "eq.PM",
-        "order": "date.asc",
-    }
-    resp = requests.get(url, headers=headers, params=params, timeout=60)
-    resp.raise_for_status()
-    return resp.json()
-
 # BLACK-SCHOLES IV (copied from /tmp/tastytrade-bot/methods.py)
 def _bs_call(F: float, K: float, T: float, sigma: float, rfr: float) -> float:
     if sigma <= 0 or T <= 0:
