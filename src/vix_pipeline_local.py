@@ -17,6 +17,7 @@ import argparse
 import requests
 import numpy as np
 import pandas as pd
+from dataclasses import dataclass
 from datetime import datetime, timedelta, date
 from scipy.optimize import brentq
 from scipy.interpolate import CubicSpline
@@ -26,6 +27,17 @@ norm = _ss.norm  # module-level alias so functions can use norm directly
 
 # Module-level smoothing knob plumbed in from --hybrid-smoothing CLI arg.
 HYBRID_SMOOTHING_SIGMA = 0.0
+
+
+@dataclass
+class VIXDecomposition:
+    total_vix_change: float
+    factor1_sticky_strike: float
+    factor2_parallel_shift: float
+    factor3_put_skew_grad: float
+    factor4_call_skew_grad: float
+    factor5_downside_conv: float
+    factor6_upside_conv: float
 
 
 # BLACK-SCHOLES IV (copied from /tmp/tastytrade-bot/methods.py)
@@ -973,7 +985,7 @@ def run_decomposition(prev: dict, curr: dict) -> VIXDecomposition | None:
     VIX_new_actual = curr.get("vix_actual") or curr.get("vix_computed", 0.0)
     total = VIX_new_actual - VIX_old_actual
 
-    return _vxd_VIXDecomposition(
+    return VIXDecomposition(
         total_vix_change=total,
         factor1_sticky_strike=F1,
         factor2_parallel_shift=F2,
@@ -1006,6 +1018,81 @@ def fetch_cboe_vix_historical():
         return records
     except Exception as e:
         return {}
+
+
+def fetch_snapshots_2026(data_dir: str | None = None):
+    """
+    Adapt OptionsDX local 2023 EOD data into the Supabase-style snapshot list
+    that main() / compute_vix_for_snapshot() consume.
+
+    rfr convention: spx_local_loader.fetch_rfr returns DECIMAL (^IRX/100). The
+    snapshot payload field "rfr" must be PERCENT, because main() does
+    `rfr = float(payload["rfr"]) / 100.0`. We therefore multiply by 100 here.
+
+    The imports of load_spx_options / fetch_rfr / fetch_vix_actual are
+    function-local because spx_local_loader.py imports from this module at
+    module top — a top-level import here would create a circular-import
+    deadlock.
+    """
+    from spx_local_loader import load_spx_options, fetch_rfr, fetch_vix_actual
+
+    if data_dir is None:
+        data_dir = os.path.expanduser("~/data/spx_eod")
+
+    chain = load_spx_options(data_dir=data_dir)
+    dates = sorted(chain["QUOTE_DATE"].unique())
+    rfr_lookup = fetch_rfr(dates)
+    vix_lookup = fetch_vix_actual(dates)
+
+    snapshots = []
+    n_done = 0
+    for quote_dt, day_df in chain.groupby("QUOTE_DATE", sort=True):
+        quote_date_str = pd.Timestamp(quote_dt).strftime("%Y-%m-%d")
+        spot = float(day_df["UNDERLYING_LAST"].iloc[0])
+
+        optionchain = {}
+        for expire_dt, exp_df in day_df.groupby("EXPIRE_DATE", sort=True):
+            if pd.Timestamp(expire_dt).date() <= pd.Timestamp(quote_dt).date():
+                continue
+            expiry_str = pd.Timestamp(expire_dt).strftime("%Y-%m-%d")
+            sub = exp_df.sort_values("STRIKE")
+            cbid = pd.to_numeric(sub["C_BID"], errors="coerce").fillna(0.0).to_numpy()
+            cask = pd.to_numeric(sub["C_ASK"], errors="coerce").fillna(0.0).to_numpy()
+            pbid = pd.to_numeric(sub["P_BID"], errors="coerce").fillna(0.0).to_numpy()
+            pask = pd.to_numeric(sub["P_ASK"], errors="coerce").fillna(0.0).to_numpy()
+            strikes = sub["STRIKE"].to_numpy()
+            rows = [
+                {"strike": float(K), "cbid": float(cb), "cask": float(ca),
+                 "pbid": float(pb), "pask": float(pa)}
+                for K, cb, ca, pb, pa in zip(strikes, cbid, cask, pbid, pask)
+            ]
+            optionchain[expiry_str] = rows
+
+        if not optionchain:
+            continue
+
+        rfr_decimal = rfr_lookup.get(pd.Timestamp(quote_dt))
+        rfr_pct = float(rfr_decimal) * 100.0 if rfr_decimal is not None else 0.0
+
+        vix_val = vix_lookup.get(pd.Timestamp(quote_dt))
+        vix_spot = float(vix_val) if vix_val is not None else None
+
+        snapshots.append({
+            "date": quote_date_str,
+            "payload": {
+                "SPX": {"spot": spot, "optionchain": optionchain},
+                "VIX": {"spot": vix_spot},
+                "rfr": rfr_pct,
+            },
+        })
+
+        n_done += 1
+        if n_done % 25 == 0:
+            print(f"  fetch_snapshots_2026: {n_done} days built...")
+
+    print(f"fetch_snapshots_2026: built {len(snapshots)} snapshots from {data_dir}")
+    return snapshots
+
 
 # MAIN
 def main():
@@ -1461,10 +1548,6 @@ def _lazy_decomp():
 def _vxd_decompose_vix_manual(*args, **kwargs):
     from vix_decomposition import decompose_vix_manual
     return decompose_vix_manual(*args, **kwargs)
-
-def _vxd_VIXDecomposition(*args, **kwargs):
-    from vix_decomposition import VIXDecomposition
-    return VIXDecomposition(*args, **kwargs)
 
 
 if __name__ == "__main__":
