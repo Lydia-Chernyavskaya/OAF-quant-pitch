@@ -13,14 +13,19 @@ from __future__ import annotations
 import os
 import json
 import math
+import argparse
 import requests
 import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta, date
 from scipy.optimize import brentq
 from scipy.interpolate import CubicSpline
+from scipy.ndimage import gaussian_filter1d
 import scipy.stats as _ss  # _ss.norm used throughout; always available before any function def
 norm = _ss.norm  # module-level alias so functions can use norm directly
+
+# Module-level smoothing knob plumbed in from --hybrid-smoothing CLI arg.
+HYBRID_SMOOTHING_SIGMA = 0.0
 
 
 # BLACK-SCHOLES IV (copied from /tmp/tastytrade-bot/methods.py)
@@ -773,6 +778,132 @@ def _bucket_vol_change(
     return vol_change
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# HYBRID BUCKET-SWAP (F3–F6 replacement)
+# ─────────────────────────────────────────────────────────────────────────────
+# Open questions:
+#   - F1/F2 stay in their existing single-strike vol-space form, NOT recast in
+#     the hybrid framework. We accept that F1+F2+F3+F4+F5+F6 won't necessarily
+#     sum to ΔVIX exactly — there may be an interaction term.
+#   - The cubic spline is fit on (m, IV) directly in IV-percent units. If
+#     artefacts appear (negative IVs, oscillations near the boundary), consider
+#     switching to total-variance space (w = T·IV²) but ONLY if the IV-space
+#     version misbehaves on real data.
+# ─────────────────────────────────────────────────────────────────────────────
+def compute_factor_hybrid(
+    prev: dict,
+    curr: dict,
+    delta_lo: float,
+    delta_hi: float,
+    side: str,
+    smoothing_sigma: float = 0.0,
+) -> float:
+    """
+    Hybrid bucket-swap factor: hold t0's spot/forward/T fixed, but overwrite
+    the option mids in the bucket using t1's IV looked up at the SAME
+    moneyness (K/S0). Then recompute VIX from the patched chains and return
+    VIX_hybrid - VIX_t0.
+
+    `side` is 'put' for F3/F5, 'call' for F4/F6. The bucket is defined by
+    [delta_lo, delta_hi] applied to t0's chain via get_strikes_in_delta_bucket
+    (whose convention: delta_lo <= delta <= delta_hi).
+    """
+    put_old_skew  = prev.get("put_skew_30d", {})
+    put_new_skew  = curr.get("put_skew_30d", {})
+    call_new_skew = curr.get("call_skew_30d", {})
+
+    if not put_old_skew or not put_new_skew or not call_new_skew:
+        return 0.0
+
+    S_old = prev["spot"]
+    S_new = curr["spot"]
+    F_old = prev["F"]
+    F_far_old = prev["F2"]
+    T1 = prev["T1"]
+    T2 = prev["T2"]
+    r  = prev["rfr"]
+
+    # ── Step A: build a smooth t1 IV function on MONEYNESS axis ───────────
+    # Combine t1's put and call dicts into one (K -> IV) covering the full smile.
+    t1_full_skew = {**put_new_skew, **call_new_skew}
+    sorted_K = sorted(t1_full_skew.keys())
+    if len(sorted_K) < 4:
+        return 0.0
+
+    m_t1  = np.array([K / S_new for K in sorted_K])
+    iv_t1 = np.array([t1_full_skew[K] for K in sorted_K], dtype=float)
+
+    if smoothing_sigma and smoothing_sigma > 0:
+        iv_t1 = gaussian_filter1d(iv_t1, sigma=float(smoothing_sigma))
+
+    t1_iv_spline = CubicSpline(m_t1, iv_t1, bc_type="natural")
+    m_lo, m_hi = m_t1[0], m_t1[-1]
+
+    # ── Step B: identify t0's bucket strikes ──────────────────────────────
+    bucket_strikes = get_strikes_in_delta_bucket(
+        prev["chain1_df"], S_old, T1, r,
+        delta_lo=delta_lo, delta_hi=delta_hi, side=side,
+    )
+    if not bucket_strikes:
+        return 0.0
+
+    # Pick BS pricer based on side. F3/F5 are puts → _bs_put + pmid;
+    # F4/F6 are calls → _bs_call + cmid.
+    if side == "put":
+        bs_price = _bs_put
+        mid_col  = "pmid"
+    else:
+        bs_price = _bs_call
+        mid_col  = "cmid"
+
+    # ── Step C: overwrite near-expiry mids at bucket strikes ──────────────
+    df_hybrid = prev["chain1_df"].copy()
+    for K in bucket_strikes:
+        m_target = K / S_old
+        # clamp to spline support to avoid extrapolation artefacts
+        if m_target < m_lo or m_target > m_hi:
+            continue
+        iv_new = float(t1_iv_spline(m_target))
+        if iv_new <= 0 or not np.isfinite(iv_new):
+            continue
+        sigma = iv_new / 100.0
+        new_price = bs_price(F_old, K, T1, sigma, r)
+        if not np.isfinite(new_price) or new_price <= 0:
+            continue
+        df_hybrid.loc[df_hybrid["strike"] == K, mid_col] = new_price
+
+    # ── Step D: same swap for far-expiry chain ────────────────────────────
+    df_hybrid_far = prev["chain2_df"].copy()
+    for K in bucket_strikes:
+        m_target = K / S_old
+        if m_target < m_lo or m_target > m_hi:
+            continue
+        iv_new = float(t1_iv_spline(m_target))
+        if iv_new <= 0 or not np.isfinite(iv_new):
+            continue
+        sigma = iv_new / 100.0
+        new_price = bs_price(F_far_old, K, T2, sigma, r)
+        if not np.isfinite(new_price) or new_price <= 0:
+            continue
+        df_hybrid_far.loc[df_hybrid_far["strike"] == K, mid_col] = new_price
+
+    # ── Step E: recompute VIX from the hybrid chains ──────────────────────
+    var_near, _, _ = compute_vix_variance(df_hybrid,     F_old,     r, T1)
+    var_far,  _, _ = compute_vix_variance(df_hybrid_far, F_far_old, r, T2)
+    if var_near <= 0 or var_far <= 0 or T2 == T1:
+        return 0.0
+
+    T30 = 30.0 / 365.0
+    var_30 = ((T2 - T30) * var_near + (T30 - T1) * var_far) / (T2 - T1)
+    if var_30 < 0:
+        return 0.0
+    vix_hybrid = 100.0 * math.sqrt(var_30)
+
+    # ── Step F: F = VIX_hybrid − VIX_t0 ───────────────────────────────────
+    vix_t0 = prev["vix_computed"]
+    return vix_hybrid - vix_t0
+
+
 def run_decomposition(prev: dict, curr: dict) -> VIXDecomposition | None:
     """
     6-factor VIX decomposition using the 30d blended skew surface.
@@ -826,49 +957,16 @@ def run_decomposition(prev: dict, curr: dict) -> VIXDecomposition | None:
         vol_new_at_S_new = get_vol_at_strike(call_new, S_new)
     F2 = vol_new_at_S_new - vol_old_at_S_new
 
-    # ── F3: Put Shoulder [-0.45, -0.15) ──
-    F3 = (bucket_variance_30d(curr['chain1_df'], curr['chain2_df'],
-                               curr['DTE_near'], curr['DTE_far'],
-                               curr['spot'], curr['rfr'],
-                               -0.45, -0.15, 'put')
-          -
-          bucket_variance_30d(prev['chain1_df'], prev['chain2_df'],
-                              prev['DTE_near'], prev['DTE_far'],
-                              prev['spot'], prev['rfr'],
-                              -0.45, -0.15, 'put')) - F2
-
-    # ── F4: Call Shoulder (0.15, 0.45] ──
-    F4 = (bucket_variance_30d(curr['chain1_df'], curr['chain2_df'],
-                               curr['DTE_near'], curr['DTE_far'],
-                               curr['spot'], curr['rfr'],
-                               0.15, 0.45, 'call')
-          -
-          bucket_variance_30d(prev['chain1_df'], prev['chain2_df'],
-                              prev['DTE_near'], prev['DTE_far'],
-                              prev['spot'], prev['rfr'],
-                              0.15, 0.45, 'call')) - F2
-
-    # ── F5: Put Wing [-0.15, -0.01) ──
-    F5 = (bucket_variance_30d(curr['chain1_df'], curr['chain2_df'],
-                               curr['DTE_near'], curr['DTE_far'],
-                               curr['spot'], curr['rfr'],
-                               -0.15, -0.01, 'put')
-          -
-          bucket_variance_30d(prev['chain1_df'], prev['chain2_df'],
-                              prev['DTE_near'], prev['DTE_far'],
-                              prev['spot'], prev['rfr'],
-                              -0.15, -0.01, 'put')) - F2 - F3
-
-    # ── F6: Call Wing (0.01, 0.15] ──
-    F6 = (bucket_variance_30d(curr['chain1_df'], curr['chain2_df'],
-                               curr['DTE_near'], curr['DTE_far'],
-                               curr['spot'], curr['rfr'],
-                               0.01, 0.15, 'call')
-          -
-          bucket_variance_30d(prev['chain1_df'], prev['chain2_df'],
-                              prev['DTE_near'], prev['DTE_far'],
-                              prev['spot'], prev['rfr'],
-                              0.01, 0.15, 'call')) - F2 - F4
+    # ── F3-F6: Warren's hybrid bucket-swap ────────────────────────────────
+    # Each Fk is its OWN counterfactual against the t0 baseline, NOT a
+    # sequential bump chain. We do not subtract F2 (or F3, F4) from the
+    # wings/shoulders here — that was a quirk of the old single-strike
+    # vol-space form. F1 and F2 stay unchanged; the hybrid F3-F6 stand alone.
+    sigma_smooth = HYBRID_SMOOTHING_SIGMA
+    F3 = compute_factor_hybrid(prev, curr, -0.45, -0.15, "put",  sigma_smooth)
+    F4 = compute_factor_hybrid(prev, curr,  0.15,  0.45, "call", sigma_smooth)
+    F5 = compute_factor_hybrid(prev, curr, -0.15, -0.01, "put",  sigma_smooth)
+    F6 = compute_factor_hybrid(prev, curr,  0.01,  0.15, "call", sigma_smooth)
 
     # ── Ground truth ────────────────────────────────────────────────────────
     VIX_old_actual = prev.get("vix_actual") or prev.get("vix_computed", 0.0)
@@ -911,6 +1009,18 @@ def fetch_cboe_vix_historical():
 
 # MAIN
 def main():
+    parser = argparse.ArgumentParser(description="VIX decomposition pipeline")
+    parser.add_argument(
+        "--hybrid-smoothing", type=float, default=0.0,
+        help="Gaussian smoothing sigma (in IV-percent samples) applied to t1's "
+             "(moneyness, IV) curve before splining for the F3-F6 hybrid swap. "
+             "0.0 disables smoothing.",
+    )
+    args, _ = parser.parse_known_args()
+    global HYBRID_SMOOTHING_SIGMA
+    HYBRID_SMOOTHING_SIGMA = float(args.hybrid_smoothing)
+    print(f"Hybrid smoothing sigma: {HYBRID_SMOOTHING_SIGMA}\n")
+
     print("Fetching 2026+ PM snapshots from Supabase...")
     snapshots = fetch_snapshots_2026()
     print(f"  Retrieved {len(snapshots)} snapshots\n")
@@ -984,6 +1094,10 @@ def main():
 
     # ── VIX Decomposition (from 2nd date onwards) ──────────────────────────
     decompositions = [None]  # placeholder for index 0 (no prev date)
+    print(f"\n{'Date':<12} {'F1':>8} {'F2':>8} {'F3h':>8} {'F4h':>8} {'F5h':>8} {'F6h':>8} "
+          f"{'sum':>8} {'dVIXact':>8} {'resid':>8}")
+    print("-" * 86)
+    residual_rows = []  # (date, F1..F6, sum, dVIX_actual, residual) — actual only
     for i in range(1, len(results)):
         try:
             decomp = run_decomposition(results[i - 1], results[i])
@@ -994,6 +1108,113 @@ def main():
             import traceback
             traceback.print_exc()
             decompositions.append(None)
+            continue
+
+        if decomp is None:
+            continue
+
+        prev_actual = results[i - 1].get("vix_actual")
+        curr_actual = results[i].get("vix_actual")
+        if prev_actual is not None and curr_actual is not None:
+            d_vix_actual = curr_actual - prev_actual
+        else:
+            d_vix_actual = results[i]["vix_computed"] - results[i - 1]["vix_computed"]
+
+        sum_f = (decomp.factor1_sticky_strike + decomp.factor2_parallel_shift
+                 + decomp.factor3_put_skew_grad + decomp.factor4_call_skew_grad
+                 + decomp.factor5_downside_conv + decomp.factor6_upside_conv)
+        residual = sum_f - d_vix_actual
+
+        date_short = results[i]["date"][:10]
+        print(f"{date_short:<12} "
+              f"{decomp.factor1_sticky_strike:>8.3f} "
+              f"{decomp.factor2_parallel_shift:>8.3f} "
+              f"{decomp.factor3_put_skew_grad:>8.3f} "
+              f"{decomp.factor4_call_skew_grad:>8.3f} "
+              f"{decomp.factor5_downside_conv:>8.3f} "
+              f"{decomp.factor6_upside_conv:>8.3f} "
+              f"{sum_f:>8.3f} {d_vix_actual:>8.3f} {residual:>8.3f}")
+
+        residual_rows.append({
+            "date": date_short,
+            "F1": decomp.factor1_sticky_strike,
+            "F2": decomp.factor2_parallel_shift,
+            "F3": decomp.factor3_put_skew_grad,
+            "F4": decomp.factor4_call_skew_grad,
+            "F5": decomp.factor5_downside_conv,
+            "F6": decomp.factor6_upside_conv,
+            "sum": sum_f,
+            "d_vix_actual": d_vix_actual,
+            "residual": residual,
+        })
+
+    # ── Hybrid summary stats + CSV ─────────────────────────────────────────
+    if residual_rows:
+        resid_arr = np.array([r["residual"] for r in residual_rows])
+        f3_arr = np.array([r["F3"] for r in residual_rows])
+        f4_arr = np.array([r["F4"] for r in residual_rows])
+        f5_arr = np.array([r["F5"] for r in residual_rows])
+        f6_arr = np.array([r["F6"] for r in residual_rows])
+        print("\n" + "=" * 70)
+        print(f"HYBRID SUMMARY (smoothing_sigma={HYBRID_SMOOTHING_SIGMA})")
+        print("=" * 70)
+        print(f"  N days:            {len(residual_rows)}")
+        print(f"  mean(residual):    {resid_arr.mean():+.4f}")
+        print(f"  std(residual):     {resid_arr.std(ddof=0):.4f}")
+        print(f"  max|residual|:     {np.abs(resid_arr).max():.4f}")
+        print(f"  mean(F3_hybrid):   {f3_arr.mean():+.4f}")
+        print(f"  mean(F4_hybrid):   {f4_arr.mean():+.4f}")
+        print(f"  mean(F5_hybrid):   {f5_arr.mean():+.4f}")
+        print(f"  mean(F6_hybrid):   {f6_arr.mean():+.4f}")
+
+    # Write hybrid CSV
+    output_dir_hybrid = os.path.join(os.path.dirname(__file__), "output")
+    os.makedirs(output_dir_hybrid, exist_ok=True)
+    hybrid_csv_path = os.path.join(output_dir_hybrid, "vix_decomposition_hybrid.csv")
+    hybrid_rows = []
+    for i, res in enumerate(results):
+        decomp = decompositions[i] if i > 0 else None
+        date_short = res["date"][:10]
+        prev_actual = results[i - 1].get("vix_actual") if i > 0 else None
+        curr_actual = res.get("vix_actual")
+        if i > 0 and prev_actual is not None and curr_actual is not None:
+            d_vix = curr_actual - prev_actual
+            d_vix_source = "actual"
+        elif i > 0:
+            d_vix = res["vix_computed"] - results[i - 1]["vix_computed"]
+            d_vix_source = "computed"
+        else:
+            d_vix = None
+            d_vix_source = None
+        row = {
+            "date": date_short,
+            "SPX": res["spot"],
+            "VIX_computed": res["vix_computed"],
+            "VIX_actual": curr_actual,
+            "delta_VIX": d_vix,
+            "delta_vix_source": d_vix_source,
+            "F1": decomp.factor1_sticky_strike if decomp else None,
+            "F2": decomp.factor2_parallel_shift if decomp else None,
+            "F3": decomp.factor3_put_skew_grad if decomp else None,
+            "F4": decomp.factor4_call_skew_grad if decomp else None,
+            "F5": decomp.factor5_downside_conv if decomp else None,
+            "F6": decomp.factor6_upside_conv if decomp else None,
+        }
+        if decomp:
+            row["sum_factors"] = (decomp.factor1_sticky_strike
+                                  + decomp.factor2_parallel_shift
+                                  + decomp.factor3_put_skew_grad
+                                  + decomp.factor4_call_skew_grad
+                                  + decomp.factor5_downside_conv
+                                  + decomp.factor6_upside_conv)
+            row["residual"] = (row["sum_factors"] - d_vix) if d_vix is not None else None
+        else:
+            row["sum_factors"] = None
+            row["residual"] = None
+        hybrid_rows.append(row)
+
+    pd.DataFrame(hybrid_rows).to_csv(hybrid_csv_path, index=False)
+    print(f"\nHybrid decomposition CSV saved to {hybrid_csv_path}")
 
     # ── Build output table ─────────────────────────────────────────────────
     hdr = (f"{'Date':<12} {'SPX_Spot':>10} {'VIX_Comp':>10} "
@@ -1063,8 +1284,17 @@ def main():
                 decomp.factor5_downside_conv,
                 decomp.factor6_upside_conv,
             ])
-            row["delta_vix"] = res["vix_computed"] - results[i - 1]["vix_computed"]
-            row["diff_computed"] = row["sum_factors"] - row["delta_vix"]
+            prev_actual = results[i - 1].get("vix_actual")
+            curr_actual = res.get("vix_actual")
+            if prev_actual is not None and curr_actual is not None:
+                d_vix = curr_actual - prev_actual
+                d_vix_source = "actual"
+            else:
+                d_vix = res["vix_computed"] - results[i - 1]["vix_computed"]
+                d_vix_source = "computed"
+            row["delta_vix"] = d_vix
+            row["delta_vix_source"] = d_vix_source
+            row["diff_computed"] = row["sum_factors"] - d_vix
         decomp_rows.append(row)
     decomp_df = pd.DataFrame(decomp_rows)
     decomp_df.to_csv(decomp_csv_path, index=False)
