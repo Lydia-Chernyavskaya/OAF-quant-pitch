@@ -85,8 +85,8 @@ def build_chain_df(optionchain_list: list) -> pd.DataFrame:
         pask = float(row.get("pask", 0) or 0)
         rows.append({
             "strike": strike,
-            "cmid": (cbid + cask) / 2 if cbid > 0 or cask > 0 else float("nan"),
-            "pmid": (pbid + pask) / 2 if pbid > 0 or pask > 0 else float("nan"),
+            "cmid": (cbid + cask) / 2 if (cbid > 0 and cask > 0) else float("nan"),
+            "pmid": (pbid + pask) / 2 if (pbid > 0 and pask > 0) else float("nan"),
             "cbid": cbid, "cask": cask, "pbid": pbid, "pask": pask,
         })
     df = pd.DataFrame(rows)
@@ -112,29 +112,34 @@ def compute_forward(df: pd.DataFrame, spot: float, rfr: float, T: float) -> floa
     if math.isnan(pmid): pmid = 0.0
     return K_atmf + math.exp(rfr * T) * (cmid - pmid)
 
-def _is_zero_quote(row: dict) -> bool:
-    cbid = row.get("cbid", 0) or 0
-    cask = row.get("cask", 0) or 0
-    pbid = row.get("pbid", 0) or 0
-    pask = row.get("pask", 0) or 0
-    return (cbid == 0 or cask == 0) and (pbid == 0 or pask == 0)
+def _is_zero_bid(row, side: str) -> bool:
+    """Cboe per-side zero-bid check.
+    side='put'  -> put bid == 0
+    side='call' -> call bid == 0
+    Used by the CBOE zero-bid truncation rule and by per-strike
+    validity checks in skew construction and bucket selection.
+    """
+    if side == 'put':
+        return (row.get("pbid", 0) or 0) == 0
+    return (row.get("cbid", 0) or 0) == 0
 
 
 def compute_vix_variance(df: pd.DataFrame, F: float, rfr: float, T: float) -> tuple[float, dict[float, float], float]:
     """
     Compute variance σ² for a single expiry using the full CBOE formula.
 
-    σ² = (2/T) × Σ[ΔKᵢ/Kᵢ² × Q(Kᵢ)] − (1/T) × [F/K₀ − 1]²
+    σ² = (2/T) × Σ[ΔKᵢ/Kᵢ² × e^(RT) × Q(Kᵢ)] − (1/T) × [F/K₀ − 1]²
 
-    Where Q(K) is the actual option mid price (not discounted).
+    The e^(RT) factor un-discounts option mids to forward measure
+    (Cboe whitepaper Exhibit 4).
 
-    CBOE zero-bid truncation: starting from ATM (K₀), walk outward in both
-    directions. A strike is excluded when TWO CONSECUTIVE strikes have zero bid
-    OR zero ask in either direction. The last valid strike before those two is
-    included.
+    CBOE zero-bid truncation (per-side): starting from ATM (K₀), walk
+    outward. On the put side (left of K₀) two consecutive zero-put-bid
+    strikes terminate the walk. On the call side (right of K₀) two
+    consecutive zero-call-bid strikes terminate the walk.
 
     Returns (total_var, contrib_dict, forward_adj) where:
-      - contrib_dict[K] = (2/T) * (dK/K²) * Q for each valid strike
+      - contrib_dict[K] = (2/T) * (dK/K²) * e^(RT) * Q for each valid strike
       - total_var = sum(contrib_dict.values()) - forward_adj (clamped >= 0)
       - forward_adj = (1/T) * ((F/K0) - 1)²  (for full VIX; skip for buckets)
     """
@@ -151,13 +156,13 @@ def compute_vix_variance(df: pd.DataFrame, F: float, rfr: float, T: float) -> tu
     valid = [True] * len(raw)
 
     for i in range(idx_atm - 1, -1, -1):
-        if _is_zero_quote(raw[i]) and _is_zero_quote(raw[i + 1]):
+        if _is_zero_bid(raw[i], 'put') and _is_zero_bid(raw[i + 1], 'put'):
             valid[i] = False
             break
         valid[i] = True
 
     for i in range(idx_atm + 1, len(raw)):
-        if _is_zero_quote(raw[i]) and _is_zero_quote(raw[i - 1]):
+        if _is_zero_bid(raw[i], 'call') and _is_zero_bid(raw[i - 1], 'call'):
             valid[i] = False
             break
         valid[i] = True
@@ -191,7 +196,7 @@ def compute_vix_variance(df: pd.DataFrame, F: float, rfr: float, T: float) -> tu
     for i in range(n):
         K = strikes[i]
         if K > 0 and Q[i] > 0:
-            contrib_dict[K] = (2.0 / T) * (dK[i] / (K ** 2)) * Q[i]
+            contrib_dict[K] = (2.0 / T) * (dK[i] / (K ** 2)) * math.exp(rfr * T) * Q[i]
 
     forward_adj = (1.0 / T) * ((F / K0_strike - 1) ** 2)
     total_var = sum(contrib_dict.values()) - forward_adj
@@ -206,15 +211,20 @@ def get_strikes_in_delta_bucket(
     delta_lo: float,
     delta_hi: float,
     side: str,
+    lower_excl: bool = False,
+    upper_excl: bool = False,
 ) -> set[float]:
     """
-    Return strikes whose N(d1) delta falls in [delta_lo, delta_hi].
+    Return strikes whose N(d1) delta falls in the [delta_lo, delta_hi]
+    interval (boundary inclusivity controlled by lower_excl / upper_excl).
 
     For each strike K in chain_df:
       1. Use bs_iv to get sigma from the option price (pmid for puts, cmid for calls)
       2. Compute d1 = (ln(spot/K) + 0.5*sigma²*T) / (sigma*sqrt(T))
       3. delta = N(d1) - 1 for puts, N(d1) for calls
-      4. Filter to [delta_lo, delta_hi] inclusive
+      4. Filter to the chosen interval. Per-side bid validity: skip
+         strikes whose relevant-side bid is zero (Cboe spec — no
+         cross-side fallback).
 
     Returns set of strikes in the delta bucket.
     """
@@ -227,16 +237,13 @@ def get_strikes_in_delta_bucket(
         if K <= 0:
             continue
 
+        if _is_zero_bid(row.to_dict(), side):
+            continue
         if side == 'put':
-            price = float(row["pmid"]) if not math.isnan(float(row["pmid"])) else None
-            if price is None or price <= 0:
-                price = float(row["cmid"]) if not math.isnan(float(row["cmid"])) else None
+            price = float(row["pmid"])
         else:
-            price = float(row["cmid"]) if not math.isnan(float(row["cmid"])) else None
-            if price is None or price <= 0:
-                price = float(row["pmid"]) if not math.isnan(float(row["pmid"])) else None
-
-        if price is None or price <= 0:
+            price = float(row["cmid"])
+        if math.isnan(price) or price <= 0:
             continue
 
         sigma_iv = bs_iv(price, spot, K, T, rfr, is_call=(side == 'call'))
@@ -250,103 +257,12 @@ def get_strikes_in_delta_bucket(
         else:
             delta_val = norm.cdf(d1)
 
-        if delta_lo <= delta_val <= delta_hi:
+        lo_ok = (delta_val > delta_lo) if lower_excl else (delta_val >= delta_lo)
+        hi_ok = (delta_val < delta_hi) if upper_excl else (delta_val <= delta_hi)
+        if lo_ok and hi_ok:
             strikes_in.add(K)
 
     return strikes_in
-
-
-def bucket_raw_contribution(
-    chain_df: pd.DataFrame,
-    spot: float,
-    T: float,
-    rfr: float,
-    delta_lo: float,
-    delta_hi: float,
-    side: str,
-) -> float:
-    """
-    Sum of w×Q for strikes in (delta_bucket_strikes ∩ valid_strikes).
-
-    Valid strikes = those that survive CBOE zero-bid truncation from compute_vix_variance.
-    w = ΔK/K², Q = option mid price.
-
-    No forward_adj, no blended skew.
-    """
-    # Compute F from chain
-    F = compute_forward(chain_df, spot, rfr, T)
-
-    # Get contrib_dict and valid strike set from compute_vix_variance internals
-    _, contrib_dict, _ = compute_vix_variance(chain_df, F, rfr, T)
-
-    if not contrib_dict:
-        return 0.0
-
-    valid_strikes = set(contrib_dict.keys())
-
-    # Get strikes in the delta bucket
-    delta_bucket_strikes = get_strikes_in_delta_bucket(
-        chain_df, spot, T, rfr, delta_lo, delta_hi, side
-    )
-
-    # Intersect and sum
-    in_bucket = valid_strikes & delta_bucket_strikes
-    total = sum(contrib_dict[K] for K in in_bucket)
-    return total
-
-
-def bucket_variance_30d(
-    chain_near: pd.DataFrame,
-    chain_far: pd.DataFrame,
-    dte_near: int,
-    dte_far: int,
-    spot: float,
-    rfr: float,
-    delta_lo: float,
-    delta_hi: float,
-    side: str,
-) -> float:
-    """
-    Compute the 30-day variance-time-weighted vol-point contribution of a delta bucket.
-
-    Steps:
-      (a) Call bucket_raw_contribution on near chain  → contrib_near
-      (b) Call bucket_raw_contribution on far chain   → contrib_far
-      (c) var_near = (2/T_near) * contrib_near
-          var_far  = (2/T_far)  * contrib_far
-      (d) Variance-time weight to 30d:
-              w1  = (dte_far - 30) / (dte_far - dte_near)
-              w2  = 1 - w1
-              var30 = w1 * var_near + w2 * var_far
-      (e) Return sqrt(var30)  — bucket's vol-point contribution
-
-    No vix_scaling anywhere.
-    """
-    T_near = dte_near / 365.0
-    T_far  = dte_far  / 365.0
-
-    # (a) near-chain contribution
-    contrib_near = bucket_raw_contribution(
-        chain_near, spot, T_near, rfr, delta_lo, delta_hi, side
-    )
-    # (b) far-chain contribution
-    contrib_far = bucket_raw_contribution(
-        chain_far, spot, T_far, rfr, delta_lo, delta_hi, side
-    )
-
-    # (c) variance for each expiry
-    var_near = (2.0 / T_near) * contrib_near
-    var_far  = (2.0 / T_far)  * contrib_far
-
-    # (d) variance-time weight to 30d
-    w1 = (dte_far - 30.0) / (dte_far - dte_near)
-    w2 = 1.0 - w1
-    var30 = w1 * var_near + w2 * var_far
-
-    if var30 <= 0:
-        return 0.0
-    # (e) sqrt → vol-point contribution
-    return math.sqrt(var30)
 
 
 def find_nearest_expiries(optionchain: dict, snapshot_date: date,
@@ -438,11 +354,11 @@ def compute_vix_for_snapshot(spot: float, rfr: float,
         return None
 
     # ── Two-expiry constant-maturity formula ─────────────────────────────────
-    # σ²_30d = [(T₂ − T₃₀)σ₁² + (T₃₀ − T₁)σ₂²] / (T₂ − T₁)
-    # VIX = 100 × √(σ²_30d)  -- variance is already annual from CBOE formula
+    # Cboe constant-maturity formula: interpolate total variance T·σ² in
+    # time, then divide by T30 to re-annualize (whitepaper Exhibit A2).
     T30 = 30.0 / 365.0
 
-    var_30d = ((T2 - T30) * var1 + (T30 - T1) * var2) / (T2 - T1)
+    var_30d = (T1 * var1 * (T2 - T30) + T2 * var2 * (T30 - T1)) / (T30 * (T2 - T1))
     if var_30d < 0:
         return None
 
@@ -512,21 +428,19 @@ def build_30day_skew(df_near: pd.DataFrame, df_far: pd.DataFrame,
         if K <= 0:
             continue
 
+        side_str = 'put' if K < K_atm_near else 'call'
+        is_put_near = (side_str == 'put')
+
         # ── Near-expiry: find nearest strike and compute IV ─────────────────
         near_strikes = df_near["strike"].values
         idx_near = np.argmin(np.abs(near_strikes - K))
         K_near_nearest = near_strikes[idx_near]
         near_row = df_near[df_near["strike"] == K_near_nearest].iloc[0]
 
-        if K < K_atm_near:
-            # Use put IV
-            price_near = near_row["pmid"] if not math.isnan(near_row["pmid"]) else near_row["cmid"]
-            is_put_near = True
-        else:
-            # Use call IV
-            price_near = near_row["cmid"] if not math.isnan(near_row["cmid"]) else near_row["pmid"]
-            is_put_near = False
-
+        # Per-side validity: skip if relevant bid is zero
+        if _is_zero_bid(near_row.to_dict(), side_str):
+            continue
+        price_near = float(near_row["pmid"] if side_str == 'put' else near_row["cmid"])
         if math.isnan(price_near) or price_near <= 0:
             continue
         iv_near = bs_iv(price_near, F_near, K_near_nearest, T_near, rfr,
@@ -540,15 +454,13 @@ def build_30day_skew(df_near: pd.DataFrame, df_far: pd.DataFrame,
         K_far_nearest = far_strikes[idx_far]
         far_row = df_far[df_far["strike"] == K_far_nearest].iloc[0]
 
-        if K < K_atm_near:
-            price_far = far_row["pmid"] if not math.isnan(far_row["pmid"]) else far_row["cmid"]
-        else:
-            price_far = far_row["cmid"] if not math.isnan(far_row["cmid"]) else far_row["pmid"]
-
+        if _is_zero_bid(far_row.to_dict(), side_str):
+            continue
+        price_far = float(far_row["pmid"] if side_str == 'put' else far_row["cmid"])
         if math.isnan(price_far) or price_far <= 0:
             continue
         iv_far = bs_iv(price_far, F_far, K_far_nearest, T_far, rfr,
-                       is_call=(K >= K_atm_near))
+                       is_call=not is_put_near)
         if iv_far <= 0:
             continue
 
@@ -601,207 +513,6 @@ def _signed_delta(K: float, S: float, vol30: float, T30: float, side: str) -> fl
         return norm.cdf(d1)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# DELTA-BUCKET CONTRIBUTION (F3–F6)
-# ─────────────────────────────────────────────────────────────────────────────
-# VIX is LINEAR in Q (mid price):
-#   σ² = (2/T) × Σ(w × Q)   where w = ΔK/K²
-# Signed delta (moneyness): put = N(d1) - 1, call = N(d1) — uses sigma_30d & spot
-# Bucket: [delta_lo, delta_hi] (inclusive both ends for put shoulder/call shoulder,
-#                                 F5/F6 uses exclusive upper bound)
-# Weight CBOE convention: interior=(K[i+1]-K[i-1])/2, edges use nearest-neighbor gap
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _bucket_contribution(
-    chain_df: pd.DataFrame,
-    spot: float,
-    sigma_30d: float,
-    T: float,
-    rfr: float,
-    delta_lo: float,
-    delta_hi: float,
-    side: str,
-    upper_excl: bool = False,
-    lower_excl: bool = False,
-) -> float:
-    """
-    Compute Σ(w × Q) for strikes whose signed_delta falls in [delta_lo, delta_hi].
-
-    Q = pmid (puts) or cmid (calls)
-    w = ΔK / K²   (CBOE convention)
-    signed_delta = N(d1) - 1 (put) or N(d1) (call)  using sigma_30d & spot
-
-    Bucket bounds: lower_excl/upper_excl control boundary inclusivity.
-    """
-    sigma = sigma_30d / 100.0
-    sqrt_T = math.sqrt(T)
-
-    df = chain_df.sort_values("strike").reset_index(drop=True)
-    strikes = df["strike"].values.astype(float)
-    n = len(strikes)
-
-    if n == 0:
-        return 0.0
-
-    # dK using CBOE convention
-    dK = np.empty(n, dtype=float)
-    dK[0]    = strikes[1] - strikes[0]
-    dK[-1]   = strikes[-1] - strikes[-2]
-    dK[1:-1] = (strikes[2:] - strikes[:-2]) / 2.0
-
-    total = 0.0
-    for i in range(n):
-        K = strikes[i]
-        dK_i = dK[i]
-
-        # signed delta at this strike using sigma_30d and spot
-        d1 = (math.log(spot / K) + 0.5 * sigma ** 2 * T) / (sigma * sqrt_T)
-        if side == 'put':
-            delta = norm.cdf(d1) - 1.0
-        else:
-            delta = norm.cdf(d1)
-
-        # filter by delta bucket
-        lo_ok = (delta > delta_lo) if lower_excl else (delta >= delta_lo)
-        hi_ok = (delta < delta_hi) if upper_excl else (delta <= delta_hi)
-        if not (lo_ok and hi_ok):
-            continue
-
-        # mid price
-        if side == 'put':
-            pmid_val = float(df.loc[i, "pmid"])
-            Q = 0.0 if math.isnan(pmid_val) else pmid_val
-        else:
-            cmid_val = float(df.loc[i, "cmid"])
-            Q = 0.0 if math.isnan(cmid_val) else cmid_val
-
-        if Q <= 0:
-            continue
-
-        total += (dK_i / (K ** 2)) * Q
-
-    return total
-
-
-def _bucket_weighted_avg_vol_change(
-    skew_old: dict, skew_new: dict,
-    S: float, T30: float, side: str,
-    delta_lo: float, delta_hi: float,
-    lower_excl: bool = False,
-    upper_excl: bool = False,
-    return_denom: bool = False
-) -> float | tuple[float, float] | None:
-    """
-    Compute the 1/K²-weighted average vol change across all strikes in a delta bucket.
-
-    Returns weighted_avg(vol_new(K) - vol_old(K)) for all strikes K where
-    the signed delta falls in the bucket interval, or None if bucket is empty.
-
-    Weight at each strike: ΔK / K²  (CBOE VIX structural weighting)
-
-    Bucket interval conventions (whitepaper):
-      F3 put shoulder  : [-0.45, -0.15)  → lower_excl=False, upper_excl=True
-      F4 call shoulder : ( 0.15,  0.45]  → lower_excl=True,  upper_excl=False
-      F5 put wing      : [-0.15, -0.01)  → lower_excl=False, upper_excl=True
-      F6 call wing      : ( 0.01,  0.15]  → lower_excl=True,  upper_excl=False
-
-    If return_denom=True, returns (weighted_avg, total_weight) instead of just weighted_avg.
-    Needed for F5/F6 where subtraction terms must be scaled by total bucket weight.
-    """
-    # Collect ALL strikes from both old and new skews (union) as numpy array
-    all_strikes = np.array(sorted(set(skew_old.keys()) | set(skew_new.keys())))
-
-    # Compute ΔK half-gap array (same as CBOE variance formula)
-    n = len(all_strikes)
-    dK = np.empty(n, dtype=float)
-    dK[0]     = all_strikes[1] - all_strikes[0]
-    dK[-1]    = all_strikes[-1] - all_strikes[-2]
-    dK[1:-1]  = (all_strikes[2:] - all_strikes[:-2]) / 2.0
-
-    numerator   = 0.0   # Σ(ΔK/K² × Δvol)
-    denominator = 0.0   # Σ(ΔK/K²)
-
-    for i, K in enumerate(all_strikes):
-        vol_old = get_vol_at_strike(skew_old, K)
-        vol_new = get_vol_at_strike(skew_new, K)
-        delta = _signed_delta(K, S, (vol_new + vol_old) / 2.0, T30, side)
-
-        # Apply interval bounds with correct exclusivity
-        lo_ok = (delta > delta_lo) if lower_excl else (delta >= delta_lo)
-        hi_ok = (delta < delta_hi) if upper_excl else (delta <= delta_hi)
-        if not (lo_ok and hi_ok):
-            continue
-        if K <= 0:
-            continue
-
-        weight = dK[i] / (K ** 2)
-        dvol = vol_new - vol_old
-        numerator   += weight * dvol
-        denominator += weight
-
-    if denominator <= 0:
-        return None
-
-    if return_denom:
-        return numerator / denominator, denominator
-    return numerator / denominator
-
-
-def _bucket_vol_change(
-    prev: dict,
-    curr: dict,
-    delta_lo: float,
-    delta_hi: float,
-    side: str,
-    upper_excl: bool = False,
-    lower_excl: bool = False,
-) -> float:
-    """
-    Compute vol-point change of a delta bucket between two dates.
-
-    Q_curr = Σ(w×Q) for curr strikes in bucket using curr sigma_30d
-    Q_prev = Σ(w×Q) for prev strikes in bucket using prev sigma_30d
-    ΔQ_bucket = Q_curr - Q_prev  (union of strikes, missing → 0)
-    var_change = (2/T) × ΔQ_bucket
-    vol_change = var_change × 100 / (2 × prev_VIX)
-    """
-    T = 30.0 / 365.0
-
-    # Q for current day
-    Q_curr = _bucket_contribution(
-        curr["chain1_df"], curr["spot"], curr["sigma_30d"],
-        T, curr["rfr"], delta_lo, delta_hi, side,
-        upper_excl=upper_excl, lower_excl=lower_excl,
-    )
-
-    # Q for previous day
-    Q_prev = _bucket_contribution(
-        prev["chain1_df"], prev["spot"], prev["sigma_30d"],
-        T, prev["rfr"], delta_lo, delta_hi, side,
-        upper_excl=upper_excl, lower_excl=lower_excl,
-    )
-
-    Delta_Q = Q_curr - Q_prev
-    var_change = (2.0 / T) * Delta_Q
-    base_vix = prev.get("vix_computed", 1.0)
-    if base_vix <= 0:
-        base_vix = 1.0
-    vol_change = var_change * 100.0 / (2.0 * base_vix)
-    return vol_change
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# HYBRID BUCKET-SWAP (F3–F6 replacement)
-# ─────────────────────────────────────────────────────────────────────────────
-# Open questions:
-#   - F1/F2 stay in their existing single-strike vol-space form, NOT recast in
-#     the hybrid framework. We accept that F1+F2+F3+F4+F5+F6 won't necessarily
-#     sum to ΔVIX exactly — there may be an interaction term.
-#   - The cubic spline is fit on (m, IV) directly in IV-percent units. If
-#     artefacts appear (negative IVs, oscillations near the boundary), consider
-#     switching to total-variance space (w = T·IV²) but ONLY if the IV-space
-#     version misbehaves on real data.
-# ─────────────────────────────────────────────────────────────────────────────
 def compute_factor_hybrid(
     prev: dict,
     curr: dict,
@@ -809,6 +520,9 @@ def compute_factor_hybrid(
     delta_hi: float,
     side: str,
     smoothing_sigma: float = 0.0,
+    f2_subtract: float = 0.0,
+    lower_excl: bool = False,
+    upper_excl: bool = False,
 ) -> float:
     """
     Hybrid bucket-swap factor: hold t0's spot/forward/T fixed, but overwrite
@@ -817,8 +531,14 @@ def compute_factor_hybrid(
     VIX_hybrid - VIX_t0.
 
     `side` is 'put' for F3/F5, 'call' for F4/F6. The bucket is defined by
-    [delta_lo, delta_hi] applied to t0's chain via get_strikes_in_delta_bucket
-    (whose convention: delta_lo <= delta <= delta_hi).
+    [delta_lo, delta_hi] applied to t0's chain via get_strikes_in_delta_bucket;
+    `lower_excl` / `upper_excl` control boundary inclusivity.
+
+    `f2_subtract`: vol-pt parallel shift to subtract from each bucket strike's
+    t1 IV before BS-pricing. Implements Cboe's "excess bid after controlling
+    for parallel shift" rule (whitepaper Aug 5 2024 walkthrough:
+    8.95 - 7.29 = 1.66). Pass F2 here to make F3-F6 orthogonal to F2.
+    f2_subtract=0.0 reproduces the previous non-orthogonal behaviour.
     """
     put_old_skew  = prev.get("put_skew_30d", {})
     put_new_skew  = curr.get("put_skew_30d", {})
@@ -855,6 +575,7 @@ def compute_factor_hybrid(
     bucket_strikes = get_strikes_in_delta_bucket(
         prev["chain1_df"], S_old, T1, r,
         delta_lo=delta_lo, delta_hi=delta_hi, side=side,
+        lower_excl=lower_excl, upper_excl=upper_excl,
     )
     if not bucket_strikes:
         return 0.0
@@ -875,7 +596,7 @@ def compute_factor_hybrid(
         # clamp to spline support to avoid extrapolation artefacts
         if m_target < m_lo or m_target > m_hi:
             continue
-        iv_new = float(t1_iv_spline(m_target))
+        iv_new = float(t1_iv_spline(m_target)) - f2_subtract
         if iv_new <= 0 or not np.isfinite(iv_new):
             continue
         sigma = iv_new / 100.0
@@ -890,7 +611,7 @@ def compute_factor_hybrid(
         m_target = K / S_old
         if m_target < m_lo or m_target > m_hi:
             continue
-        iv_new = float(t1_iv_spline(m_target))
+        iv_new = float(t1_iv_spline(m_target)) - f2_subtract
         if iv_new <= 0 or not np.isfinite(iv_new):
             continue
         sigma = iv_new / 100.0
@@ -906,7 +627,7 @@ def compute_factor_hybrid(
         return 0.0
 
     T30 = 30.0 / 365.0
-    var_30 = ((T2 - T30) * var_near + (T30 - T1) * var_far) / (T2 - T1)
+    var_30 = (T1 * var_near * (T2 - T30) + T2 * var_far * (T30 - T1)) / (T30 * (T2 - T1))
     if var_30 < 0:
         return 0.0
     vix_hybrid = 100.0 * math.sqrt(var_30)
@@ -918,24 +639,25 @@ def compute_factor_hybrid(
 
 def run_decomposition(prev: dict, curr: dict) -> VIXDecomposition | None:
     """
-    6-factor VIX decomposition using the 30d blended skew surface.
+    6-factor VIX decomposition (Cboe Aug 2025 framework, hybrid swap).
 
-    After building the 30d blended skew on each date, the near/far chains are
-    never referenced again. All factors operate on the blended put/call skew dicts.
+    F1, F2 are vol-pt amounts measured at a single ATM strike on the
+    30-day blended skew (whitepaper p13-p14):
+        F1 = σ_old(S_new) − σ_old(S_old)        sticky strike
+        F2 = σ_new(S_new) − σ_old(S_new)        parallel shift
 
-    F1  Sticky Strike  : σ30_old(S_new) − σ30_old(S_old)
-    F2  Parallel Shift : σ30_new(S_new) − σ30_old(S_new)
-    F3  Put Shoulder   : Δbucket_var(put, -45:-15) / (2×VIX) − F2
-    F4  Call Shoulder  : Δbucket_var(call, +15:+45) / (2×VIX) − F2
-    F5  Put Wing       : Σ(w × ΔQ_put) − F2 − F3  (raw price contribution, no vol scaling)
-    F6  Call Wing      : Σ(w × ΔQ_call) − F2 − F4  (raw price contribution, no vol scaling)
+    F3–F6 are VIX-pt impacts of bucket-swap counterfactuals on the t0
+    chain, where each bucket's t1 IVs are used MINUS the F2 parallel
+    shift (Cboe's "excess bid after controlling for parallel shift" rule;
+    worked example: 8.95 - 7.29 = 1.66). Buckets:
+        F3 put shoulder      delta in [-.45, -.15)
+        F4 call shoulder     delta in ( .15,  .45]
+        F5 put wing          delta in [-.15, -.01)
+        F6 call wing         delta in ( .01,  .15]
 
-    F3-F4 use var-to-vol conversion: vol_change = (2/T) × Δ(Σ w×Q) × 100 / (2×VIX)
-    F5-F6 use raw price contribution Σ(w × ΔQ) directly per whitepaper spec:
-      w = ΔK/K², ΔQ = Q_new(K) - Q_old(K) at same strike
-      F5/F6 are NOT scaled by 100/(2×VIX) — they use raw Σ(w×ΔQ) in vol-point equivalent units
-
-    F1/F2 use the blended skew surface (unchanged).
+    Sum F1..F6 ≈ ΔVIX. Residual = unit mismatch between vol-pt (F1, F2)
+    and VIX-pt (F3-F6) factors, plus genuine interaction terms. On calm
+    days the residual is small because VIX ≈ ATM IV.
     """
     put_old  = prev.get("put_skew_30d", {})
     put_new  = curr.get("put_skew_30d", {})
@@ -947,38 +669,40 @@ def run_decomposition(prev: dict, curr: dict) -> VIXDecomposition | None:
 
     S_old = prev["spot"]
     S_new = curr["spot"]
-    T30   = 30.0 / 365.0
 
-    # ── F1: Sticky Strike ─────────────────────────────────────────────────
-    # σ30 at NEW spot on OLD blended skew, minus σ30 at OLD ATM on OLD blended skew.
-    # ATM vol is the average of put and call IVs at the old ATM strike.
+    # Direction-appropriate side: sample t0 and t1 skews on the same side
+    # at both S_new and S_old. Avoids the asymmetric "single-side at S_new,
+    # averaged at S_old" inconsistency in the previous code.
     if S_new < S_old:
-        vol_old_at_S_new = get_vol_at_strike(put_old, S_new)
+        skew_old_use = put_old
+        skew_new_use = put_new
     else:
-        vol_old_at_S_new = get_vol_at_strike(call_old, S_new)
-    vol_old_put_atm  = get_vol_at_strike(put_old,  S_old)
-    vol_old_call_atm = get_vol_at_strike(call_old, S_old)
-    vol_old_atm_old  = (vol_old_put_atm + vol_old_call_atm) / 2.0
-    F1 = vol_old_at_S_new - vol_old_atm_old
+        skew_old_use = call_old
+        skew_new_use = call_new
 
-    # ── F2: Parallel Shift ─────────────────────────────────────────────────
-    # σ30 at NEW spot on NEW blended skew, minus σ30 at same strike on OLD skew.
-    if S_new < S_old:
-        vol_new_at_S_new = get_vol_at_strike(put_new, S_new)
-    else:
-        vol_new_at_S_new = get_vol_at_strike(call_new, S_new)
+    vol_old_at_S_new = get_vol_at_strike(skew_old_use, S_new)
+    vol_old_at_S_old = get_vol_at_strike(skew_old_use, S_old)
+    vol_new_at_S_new = get_vol_at_strike(skew_new_use, S_new)
+
+    # F1 sticky strike: σ_old(S_new) − σ_old(S_old)   (Cboe whitepaper p13)
+    F1 = vol_old_at_S_new - vol_old_at_S_old
+
+    # F2 parallel shift: σ_new(S_new) − σ_old(S_new)  (Cboe whitepaper p14)
     F2 = vol_new_at_S_new - vol_old_at_S_new
 
-    # ── F3-F6: Warren's hybrid bucket-swap ────────────────────────────────
-    # Each Fk is its OWN counterfactual against the t0 baseline, NOT a
-    # sequential bump chain. We do not subtract F2 (or F3, F4) from the
-    # wings/shoulders here — that was a quirk of the old single-strike
-    # vol-space form. F1 and F2 stay unchanged; the hybrid F3-F6 stand alone.
     sigma_smooth = HYBRID_SMOOTHING_SIGMA
-    F3 = compute_factor_hybrid(prev, curr, -0.45, -0.15, "put",  sigma_smooth)
-    F4 = compute_factor_hybrid(prev, curr,  0.15,  0.45, "call", sigma_smooth)
-    F5 = compute_factor_hybrid(prev, curr, -0.15, -0.01, "put",  sigma_smooth)
-    F6 = compute_factor_hybrid(prev, curr,  0.01,  0.15, "call", sigma_smooth)
+    F3 = compute_factor_hybrid(prev, curr, -0.45, -0.15, "put",  sigma_smooth,
+                               f2_subtract=F2,
+                               lower_excl=False, upper_excl=True)   # [-.45, -.15)
+    F4 = compute_factor_hybrid(prev, curr,  0.15,  0.45, "call", sigma_smooth,
+                               f2_subtract=F2,
+                               lower_excl=True,  upper_excl=False)  # (.15, .45]
+    F5 = compute_factor_hybrid(prev, curr, -0.15, -0.01, "put",  sigma_smooth,
+                               f2_subtract=F2,
+                               lower_excl=False, upper_excl=True)   # [-.15, -.01)
+    F6 = compute_factor_hybrid(prev, curr,  0.01,  0.15, "call", sigma_smooth,
+                               f2_subtract=F2,
+                               lower_excl=True,  upper_excl=False)  # (.01, .15]
 
     # ── Ground truth ────────────────────────────────────────────────────────
     VIX_old_actual = prev.get("vix_actual") or prev.get("vix_computed", 0.0)
@@ -1108,7 +832,7 @@ def main():
     HYBRID_SMOOTHING_SIGMA = float(args.hybrid_smoothing)
     print(f"Hybrid smoothing sigma: {HYBRID_SMOOTHING_SIGMA}\n")
 
-    print("Fetching 2026+ PM snapshots from Supabase...")
+    print("Loading SPX EOD snapshots from local OptionsDX archive...")
     snapshots = fetch_snapshots_2026()
     print(f"  Retrieved {len(snapshots)} snapshots\n")
 
@@ -1540,15 +1264,6 @@ def main():
         plt.close()
     except Exception as e:
         print(f"Chart generation failed (non-critical): {e}")
-
-def _lazy_decomp():
-    from vix_decomposition import decompose_vix_manual, VIXDecomposition
-    return decompose_vix_manual, VIXDecomposition
-
-def _vxd_decompose_vix_manual(*args, **kwargs):
-    from vix_decomposition import decompose_vix_manual
-    return decompose_vix_manual(*args, **kwargs)
-
 
 if __name__ == "__main__":
     main()
