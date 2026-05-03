@@ -50,9 +50,9 @@ def plot_skew_panel(ax, t0_res: dict, t1_res: dict,
         ax.scatter(ks, ys, s=SKEW_MARKER_SIZE, color=color,
                    alpha=SKEW_ALPHA, label=label, zorder=2)
 
-    ax.set_yticks([0, 32, 64, 96, 128, 160])
-    ax.set_yticklabels(["0%", "32%", "64%", "96%", "128%", "160%"])
-    ax.set_ylim(0, 160)
+    ax.set_yticks([0, 32, 64, 96, 128])
+    ax.set_yticklabels(["0%", "32%", "64%", "96%", "128%"])
+    ax.set_ylim(0, 128)
     ax.set_xlabel("Strike")
     ax.set_ylabel("Implied Volatility")
     ax.set_title(title, fontsize=12, fontweight="bold")
