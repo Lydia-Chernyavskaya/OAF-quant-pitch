@@ -79,9 +79,27 @@ def load_spx_options(data_dir=None, quote_dates=None):
             f"No SPX EOD .txt files found under {data_dir}. "
             f"Expected files matching spx_eod_*.txt at any depth."
         )
+
+    # File-level filter: when quote_dates is supplied, derive the YYYYMM
+    # set from the requested days and keep only files matching
+    # spx_eod_YYYYMM.txt. Avoids reading 20+ months of data when we only
+    # need the four event-study days.
+    if quote_dates is not None:
+        target_yyyymm = set()
+        for d in quote_dates:
+            ts = pd.to_datetime(d)
+            target_yyyymm.add(f"{ts.year:04d}{ts.month:02d}")
+        files = [f for f in files
+                 if any(f.endswith(f"spx_eod_{yyyymm}.txt") for yyyymm in target_yyyymm)]
+        if not files:
+            raise FileNotFoundError(
+                f"quote_dates {quote_dates} maps to YYYYMM set {target_yyyymm} "
+                f"but no matching spx_eod_YYYYMM.txt files found under {data_dir}"
+            )
+
     dfs = []
     for f in files:
-        df = pd.read_csv(f)
+        df = pd.read_csv(f, low_memory=False)
         df.columns = [c.strip().strip("[]") for c in df.columns]
         for col in ["QUOTE_DATE", "EXPIRE_DATE"]:
             df[col] = df[col].str.strip()

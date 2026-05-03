@@ -44,6 +44,19 @@ EVENTS = [
 ]
 
 
+# Source: CBOE VIX_History.csv (https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX_History.csv)
+# Cross-checked against:
+#  - Cboe research paper "After the Volpocalypse" (2018-02-05 = 37.32)
+#  - FRED series VIXCLS (https://fred.stlouisfed.org/series/VIXCLS)
+#  - Macroption historical VIX records
+REFERENCE_VIX_CLOSE = {
+    "2018-02-02": 17.31,
+    "2018-02-05": 37.32,
+    "2020-03-13": 57.83,
+    "2020-03-16": 82.69,
+}
+
+
 def build_snapshot_for_day(day_df: pd.DataFrame, quote_dt: pd.Timestamp,
                            rfr_decimal: float, vix_actual: float | None) -> dict:
     """Build the {date, payload} dict that compute_vix_for_snapshot expects.
@@ -98,8 +111,11 @@ def process_day(snap: dict, cboe_vix: dict) -> dict:
     if res is None:
         raise RuntimeError(f"compute_vix_for_snapshot returned None for {snap['date']}")
 
-    # CBOE VIX preferred over data-source VIX, but accept either.
-    if snap["date"] in cboe_vix:
+    # Priority: hard-coded reference closes (deterministic) → live CBOE
+    # CSV (when the endpoint is available) → data-source VIX.spot.
+    if snap["date"] in REFERENCE_VIX_CLOSE:
+        res["vix_actual"] = REFERENCE_VIX_CLOSE[snap["date"]]
+    elif snap["date"] in cboe_vix:
         res["vix_actual"] = cboe_vix[snap["date"]]
     elif payload.get("VIX", {}).get("spot") is not None:
         res["vix_actual"] = payload["VIX"]["spot"]
@@ -203,9 +219,9 @@ def _plot_skew_panel(ax, t0_res: dict, t1_res: dict, t0_str: str, t1_str: str,
         ys = [skew[k] for k in ks]
         ax.scatter(ks, ys, s=msize, color=color, alpha=0.7, label=label, zorder=2)
 
-    ax.set_yticks([0, 32, 64, 96, 128, 160])
-    ax.set_yticklabels(["0%", "32%", "64%", "96%", "128%", "160%"])
-    ax.set_ylim(0, 160)
+    ax.set_yticks([0, 16, 32, 48, 64, 80, 96, 128])
+    ax.set_yticklabels(["0%", "16%", "32%", "48%", "64%", "80%", "96%", "128%"])
+    ax.set_ylim(0, 128)
     ax.set_xlabel("Strike")
     ax.set_ylabel("Implied Volatility")
     ax.set_title(title, fontsize=12, fontweight="bold")
