@@ -603,7 +603,7 @@ def compute_factor_hybrid(
     # ── Step C: overwrite near-expiry mids at bucket strikes ──────────────
     df_hybrid = prev["chain1_df"].copy()
     for K in bucket_strikes:
-        m_target = K / S_old
+        m_target = K / S_new
         # clamp to spline support to avoid extrapolation artefacts
         if m_target < m_lo or m_target > m_hi:
             continue
@@ -619,7 +619,7 @@ def compute_factor_hybrid(
     # ── Step D: same swap for far-expiry chain ────────────────────────────
     df_hybrid_far = prev["chain2_df"].copy()
     for K in bucket_strikes:
-        m_target = K / S_old
+        m_target = K / S_new
         if m_target < m_lo or m_target > m_hi:
             continue
         iv_new = float(t1_iv_spline(m_target)) - f2_subtract
