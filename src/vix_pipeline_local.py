@@ -687,19 +687,17 @@ def run_decomposition(prev: dict, curr: dict) -> VIXDecomposition | None:
     S_old = prev["spot"]
     S_new = curr["spot"]
 
-    # Direction-appropriate side: sample t0 and t1 skews on the same side
-    # at both S_new and S_old. Avoids the asymmetric "single-side at S_new,
-    # averaged at S_old" inconsistency in the previous code.
-    if S_new < S_old:
-        skew_old_use = put_old
-        skew_new_use = put_new
-    else:
-        skew_old_use = call_old
-        skew_new_use = call_new
+    # Combine put and call skews into a single full-smile dict.
+    # The split-by-ATM convention in build_30day_skew makes put_old's
+    # support end at K_atm_near and call_old's support begin there;
+    # the F1 lookup needs both sides to span S_old and S_new without
+    # clamping to edge values.
+    skew_old_full = {**put_old, **call_old}
+    skew_new_full = {**put_new, **call_new}
 
-    vol_old_at_S_new = get_vol_at_strike(skew_old_use, S_new)
-    vol_old_at_S_old = get_vol_at_strike(skew_old_use, S_old)
-    vol_new_at_S_new = get_vol_at_strike(skew_new_use, S_new)
+    vol_old_at_S_new = get_vol_at_strike(skew_old_full, S_new)
+    vol_old_at_S_old = get_vol_at_strike(skew_old_full, S_old)
+    vol_new_at_S_new = get_vol_at_strike(skew_new_full, S_new)
 
     # F1 sticky strike: σ_old(S_new) − σ_old(S_old)   (Cboe whitepaper p13)
     F1 = vol_old_at_S_new - vol_old_at_S_old
@@ -1127,6 +1125,27 @@ def main():
     decomp_df = pd.DataFrame(decomp_rows)
     decomp_df.to_csv(decomp_csv_path, index=False)
     print(f"\nDecomposition CSV saved to {decomp_csv_path}")
+
+    # ── F1 sign + zero-count diagnostic ──────────────────────────────────
+    try:
+        diag_df = pd.read_csv(hybrid_csv_path).dropna(subset=["F1"]).copy()
+        diag_df["dSPX_pct"] = diag_df["SPX"].pct_change()
+        diag_df = diag_df.dropna(subset=["dSPX_pct"]).copy()
+        n_zero = int((diag_df["F1"].abs() < 1e-12).sum())
+        spot_up = diag_df[diag_df["dSPX_pct"] > 0]
+        spot_dn = diag_df[diag_df["dSPX_pct"] < 0]
+        corr_f1 = float(diag_df["F1"].corr(diag_df["dSPX_pct"]))
+        print("\n" + "=" * 70)
+        print("F1 SIGN DIAGNOSTIC")
+        print("=" * 70)
+        print(f"  F1 == 0 rows:        {n_zero}/{len(diag_df)}")
+        print(f"  spot-up days F1<0:   {(spot_up['F1']<0).mean()*100:.1f}% "
+              f"({(spot_up['F1']<0).sum()}/{len(spot_up)})")
+        print(f"  spot-dn days F1>0:   {(spot_dn['F1']>0).mean()*100:.1f}% "
+              f"({(spot_dn['F1']>0).sum()}/{len(spot_dn)})")
+        print(f"  corr(F1, dSPX_pct):  {corr_f1:+.4f}")
+    except Exception as e:
+        print(f"\nF1 sign diagnostic skipped: {e}")
 
     # ── CBOE Comparison Summary ───────────────────────────────────────────
     print("\n" + "=" * 70)
