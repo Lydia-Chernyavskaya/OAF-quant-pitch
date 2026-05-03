@@ -1,0 +1,201 @@
+==============================================================================
+2018-02-02 chain summary
+==============================================================================
+  spot=2760.86  F_near=2760.50  T_near=0.0767 (28d)  T_far=0.0849 (31d)
+  near chain: 183 strikes [1300 .. 3500]
+  far chain:  104 strikes [1800 .. 3300]
+  call_skew_30d: 42 strikes  max K = 3075.0
+  put_skew_30d:  55 strikes  min K = 1800.0
+
+==============================================================================
+2018-02-05 chain summary
+==============================================================================
+  spot=2648.79  F_near=2655.75  T_near=0.0822 (30d)  T_far=0.0877 (32d)
+  near chain: 117 strikes [1800 .. 3300]
+  far chain:  178 strikes [1100 .. 3400]
+  call_skew_30d: 37 strikes  max K = 2830.0
+  put_skew_30d:  40 strikes  min K = 1900.0
+
+==============================================================================
+Call wing comparison: strikes K > 2830 up to 3500
+==============================================================================
+  K_max in call_skew_30d  : t0=3075  t1=2830
+  K_max in near chain     : t0=3500  t1=3300
+
+==============================================================================
+Per-strike call rejection trace — t0=2018-02-02
+==============================================================================
+        K     cbid    cask    cmid     pbid    pask  reason
+  ---------------------------------------------------------
+     2835    9.800  10.290  10.045   84.100  85.200  PASSED (iv_n=11.51%, iv_f=11.64%, var30=1.1063e-03)
+     2840    7.900   8.900   8.400   83.310  91.900  PASSED (iv_n=11.17%, iv_f=11.14%, var30=1.0220e-03)
+     2845    4.200  12.010   8.105   91.610  94.090  PASSED (iv_n=11.45%, iv_f=11.02%, var30=1.0232e-03)
+     2850    3.410  10.910   7.160   95.590  98.300  PASSED (iv_n=11.37%, iv_f=11.26%, var30=1.0482e-03)
+     2855    5.100   5.790   5.445   99.710 102.500  PASSED (iv_n=10.79%, iv_f=10.71%, var30=9.4696e-04)
+     2860    4.600   5.090   4.845  100.700 109.610  PASSED (iv_n=10.79%, iv_f=10.71%, var30=9.4753e-04)
+     2865    3.800   4.400   4.100  108.100 110.900  PASSED (iv_n=10.65%, iv_f=10.55%, var30=9.2053e-04)
+     2870    3.400   3.910   3.655  109.110 119.090  PASSED (iv_n=10.68%, iv_f=10.57%, var30=9.2469e-04)
+     2875    2.900   3.400   3.150  115.900 118.900  PASSED (iv_n=10.62%, iv_f=10.48%, var30=9.1063e-04)
+     2880    2.600   2.900   2.750  121.010 124.010  PASSED (iv_n=10.60%, iv_f=10.43%, var30=9.0371e-04)
+     2885    2.000   2.550   2.275  124.990 128.100  PASSED (iv_n=10.47%, iv_f=10.37%, var30=8.8852e-04)
+     2890    1.800   2.290   2.045  130.800 134.000  PASSED (iv_n=10.54%, iv_f=10.33%, var30=8.8809e-04)
+     2895    1.640   2.000   1.820  135.500 138.800  PASSED (iv_n=10.59%, iv_f=10.35%, var30=8.9251e-04)
+     2900    1.390   1.740   1.565  134.600 148.590  PASSED (iv_n=10.56%, iv_f=10.33%, var30=8.8978e-04)
+     2905    1.190   1.600   1.395  139.110 152.100  far call bid = 0
+     2910    1.060   1.400   1.230  149.900 153.200  PASSED (iv_n=10.66%, iv_f=10.38%, var30=9.0056e-04)
+     2915    0.910   1.250   1.080  153.910 157.300  PASSED (iv_n=10.69%, iv_f=10.52%, var30=9.1832e-04)
+     2920    0.850   1.110   0.980  159.600 162.990  PASSED (iv_n=10.78%, iv_f=10.55%, var30=9.2782e-04)
+     2925    0.710   1.050   0.880  158.800 172.800  PASSED (iv_n=10.85%, iv_f=10.52%, var30=9.2758e-04)
+     2930    0.600   0.940   0.770  167.210 173.900  PASSED (iv_n=10.88%, iv_f=10.67%, var30=9.4758e-04)
+     2935    0.550   0.890   0.720  168.600 182.700  K not in far chain (intersection requirement)
+     2940    0.510   0.800   0.655  177.810 184.400  PASSED (iv_n=11.12%, iv_f=10.71%, var30=9.6562e-04)
+     2945    0.450   0.690   0.570  182.700 189.400  K not in far chain (intersection requirement)
+     2950    0.400   0.760   0.580  187.000 193.610  PASSED (iv_n=11.41%, iv_f=11.00%, var30=1.0178e-03)
+     2955    0.400   0.600   0.500  188.690 202.000  K not in far chain (intersection requirement)
+     2960    0.360   0.650   0.505  193.300 207.000  PASSED (iv_n=11.67%, iv_f=11.21%, var30=1.0593e-03)
+     2965    0.300   0.600   0.450  198.300 211.900  K not in far chain (intersection requirement)
+     2970    0.250   0.550   0.400  206.900 213.300  PASSED (iv_n=11.77%, iv_f=11.50%, var30=1.1023e-03)
+     2975    0.260   0.560   0.410  206.300 222.300  PASSED (iv_n=12.04%, iv_f=11.55%, var30=1.1261e-03)
+     2980    0.250   0.440   0.345  213.800 226.800  K not in far chain (intersection requirement)
+     2985    0.260   0.450   0.355  222.600 228.910  K not in far chain (intersection requirement)
+     2990    0.210   0.450   0.330  226.800 233.090  K not in far chain (intersection requirement)
+     2995    0.150   0.450   0.300  226.210 242.190  K not in far chain (intersection requirement)
+     3000    0.160   0.450   0.305  236.800 243.000  PASSED (iv_n=12.70%, iv_f=12.03%, var30=1.2322e-03)
+     3005    0.150   0.400   0.275  232.300 253.790  K not in far chain (intersection requirement)
+     3010    0.150   0.350   0.250  246.800 253.010  K not in far chain (intersection requirement)
+     3015    0.150   0.350   0.250  251.800 257.900  K not in far chain (intersection requirement)
+     3020    0.160   0.340   0.250  249.500 268.710  K not in far chain (intersection requirement)
+     3025    0.150   0.350   0.250  261.810 267.790  far call bid = 0
+     3030    0.150   0.360   0.255  262.210 274.300  K not in far chain (intersection requirement)
+     3035    0.100   0.300   0.200  267.100 279.210  K not in far chain (intersection requirement)
+     3040    0.100   0.290   0.195  272.200 284.300  K not in far chain (intersection requirement)
+     3045    0.100   0.300   0.200  274.400 293.800  K not in far chain (intersection requirement)
+     3050    0.100   0.300   0.200  282.110 294.200  PASSED (iv_n=14.17%, iv_f=13.80%, var30=1.5911e-03)
+     3055    0.100   0.310   0.205  287.000 299.110  K not in far chain (intersection requirement)
+     3060    0.110   0.300   0.205  292.000 304.100  K not in far chain (intersection requirement)
+     3065    0.040   0.300   0.170  294.400 313.400  K not in far chain (intersection requirement)
+     3070    0.060   0.250   0.155  302.000 314.100  K not in far chain (intersection requirement)
+     3075    0.040   0.260   0.150  307.000 319.100  PASSED (iv_n=14.73%, iv_f=14.42%, var30=1.7320e-03)
+     3080    0.040   0.240   0.140  312.000 324.100  K not in far chain (intersection requirement)
+     3100    0.050   0.250   0.150  329.300 348.300  far call bid = 0
+     3125        -       -       -        -       -  K not in NEAR chain
+     3150    0.000   0.190     nan  381.800 393.890  near call bid = 0
+     3200    0.000   0.200     nan  429.000 448.090  near call bid = 0
+     3250    0.000   0.100     nan  481.610 493.710  near call bid = 0
+     3300    0.000   0.160     nan  531.500 543.590  near call bid = 0
+     3400    0.000   0.110     nan  631.400 643.500  near call bid = 0
+     3500    0.000   4.300     nan  731.200 743.300  near call bid = 0
+
+==============================================================================
+Per-strike call rejection trace — t1=2018-02-05
+==============================================================================
+        K     cbid    cask    cmid     pbid    pask  reason
+  ---------------------------------------------------------
+     2835    0.000  10.000     nan  180.100 196.100  near call bid = 0
+     2840    0.000  10.000     nan  184.500 200.400  near call bid = 0
+     2845    0.000  10.000     nan  186.790 202.810  near call bid = 0
+     2850    0.000  10.000     nan  193.510 209.500  near call bid = 0
+     2855    0.000  10.000     nan  196.410 212.400  near call bid = 0
+     2860    1.600   7.600   4.600  196.600 212.600  far call bid = 0
+     2865    0.000  10.000     nan  198.110 214.090  near call bid = 0
+     2870    0.000  10.000     nan  205.900 229.900  near call bid = 0
+     2875    0.000  10.000     nan  214.000 238.000  near call bid = 0
+     2880    0.000  10.000     nan  221.300 245.300  near call bid = 0
+     2885    0.000   9.990     nan  226.200 250.210  near call bid = 0
+     2890    0.000  10.000     nan  228.490 252.510  near call bid = 0
+     2895    0.000  10.000     nan  233.400 257.400  near call bid = 0
+     2900    0.110   5.490   2.800  238.300 262.290  far call bid = 0
+     2905    0.000   5.390     nan  240.000 264.000  near call bid = 0
+     2910    0.000  10.000     nan  244.910 268.900  near call bid = 0
+     2915    0.000  10.000     nan  253.000 277.010  near call bid = 0
+     2920    0.000  10.000     nan  257.700 281.700  near call bid = 0
+     2925    0.000  10.000     nan  262.700 286.700  near call bid = 0
+     2930    0.000   4.690     nan  260.200 284.200  near call bid = 0
+     2935    0.000   4.600     nan  272.200 296.200  near call bid = 0
+     2940    0.000   9.990     nan  277.600 301.590  near call bid = 0
+     2945    0.000   4.400     nan  282.390 306.390  near call bid = 0
+     2950    0.000  10.000     nan  279.910 303.910  near call bid = 0
+     2955        -       -       -        -       -  K not in NEAR chain
+     2960    0.000   4.100     nan  290.010 314.000  near call bid = 0
+     2965        -       -       -        -       -  K not in NEAR chain
+     2970    0.000   3.900     nan  299.700 323.710  near call bid = 0
+     2975    0.000   3.810     nan  312.200 336.200  near call bid = 0
+     2980    0.000   3.700     nan  309.610 333.600  near call bid = 0
+     2985        -       -       -        -       -  K not in NEAR chain
+     2990    0.000   3.600     nan  327.110 351.100  near call bid = 0
+     2995        -       -       -        -       -  K not in NEAR chain
+     3000    0.000   3.500     nan  329.510 353.490  near call bid = 0
+     3005        -       -       -        -       -  K not in NEAR chain
+     3010        -       -       -        -       -  K not in NEAR chain
+     3015        -       -       -        -       -  K not in NEAR chain
+     3020        -       -       -        -       -  K not in NEAR chain
+     3025    0.000   9.990     nan  361.500 385.500  near call bid = 0
+     3030        -       -       -        -       -  K not in NEAR chain
+     3035        -       -       -        -       -  K not in NEAR chain
+     3040        -       -       -        -       -  K not in NEAR chain
+     3045        -       -       -        -       -  K not in NEAR chain
+     3050    0.000  10.000     nan  386.200 410.210  near call bid = 0
+     3055        -       -       -        -       -  K not in NEAR chain
+     3060        -       -       -        -       -  K not in NEAR chain
+     3065        -       -       -        -       -  K not in NEAR chain
+     3070        -       -       -        -       -  K not in NEAR chain
+     3075    0.000  10.000     nan  404.090 428.090  near call bid = 0
+     3080        -       -       -        -       -  K not in NEAR chain
+     3100    0.000  10.000     nan  436.700 460.600  near call bid = 0
+     3125    0.000   9.990     nan  459.200 483.200  near call bid = 0
+     3150    0.000  10.000     nan  478.910 502.910  near call bid = 0
+     3200    0.000  10.000     nan  536.400 560.210  near call bid = 0
+     3250    0.000  10.000     nan  586.200 610.090  near call bid = 0
+     3300    0.000   9.990     nan  628.500 652.400  near call bid = 0
+     3400        -       -       -        -       -  K not in NEAR chain
+     3500        -       -       -        -       -  K not in NEAR chain
+
+==============================================================================
+t0-vs-t1 admission table (CALL side)
+==============================================================================
+        K                    t0                    t1
+  --------------------------------------------------------
+     2835              ADMITTED  near call bid = 0
+     2840              ADMITTED  near call bid = 0
+     2845              ADMITTED  near call bid = 0
+     2850              ADMITTED  near call bid = 0
+     2855              ADMITTED  near call bid = 0
+     2860              ADMITTED  far call bid = 0
+     2865              ADMITTED  near call bid = 0
+     2870              ADMITTED  near call bid = 0
+     2875              ADMITTED  near call bid = 0
+     2880              ADMITTED  near call bid = 0
+     2885              ADMITTED  near call bid = 0
+     2890              ADMITTED  near call bid = 0
+     2895              ADMITTED  near call bid = 0
+     2900              ADMITTED  far call bid = 0
+     2910              ADMITTED  near call bid = 0
+     2915              ADMITTED  near call bid = 0
+     2920              ADMITTED  near call bid = 0
+     2925              ADMITTED  near call bid = 0
+     2930              ADMITTED  near call bid = 0
+     2940              ADMITTED  near call bid = 0
+     2950              ADMITTED  near call bid = 0
+     2960              ADMITTED  near call bid = 0
+     2970              ADMITTED  near call bid = 0
+     2975              ADMITTED  near call bid = 0
+     3000              ADMITTED  near call bid = 0
+     3050              ADMITTED  near call bid = 0
+     3075              ADMITTED  near call bid = 0
+==============================================================================
+Summary of t1 call-wing rejection causes
+==============================================================================
+  near_zero_bid       : 37
+  far_zero_bid        : 2
+  k_not_in_far        : 0
+  k_not_in_near       : 19
+  cmid_floor          : 0
+  iv_solver_fail      : 0
+  var30_neg           : 0
+  passed              : 0
+  other               : 0
+==============================================================================
+Recommendation
+==============================================================================
+  (A) Genuine market-data limitation: market makers pulled quotes on the call wing once vol exploded. The skew chart is correctly truncating. No code change needed; add a deck caption noting MM behaviour on Monday post-XIV blow-up.
+
