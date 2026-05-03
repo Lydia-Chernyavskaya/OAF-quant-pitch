@@ -44,16 +44,26 @@ EVENTS = [
 ]
 
 
-# Source: CBOE VIX_History.csv (https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX_History.csv)
+# Reference CBOE VIX close values for the four event-study dates.
+# Hard-coded as fallback because fetch_cboe_vix_historical() occasionally
+# returns 0 records when the CBOE CSV endpoint is rate-limited or down.
+#
+# Primary source: CBOE VIX_History.csv
+#   https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX_History.csv
+#
 # Cross-checked against:
-#  - Cboe research paper "After the Volpocalypse" (2018-02-05 = 37.32)
-#  - FRED series VIXCLS (https://fred.stlouisfed.org/series/VIXCLS)
-#  - Macroption historical VIX records
+#   - CBOE research paper "After the Volpocalypse" (Feb 2018):
+#     2018-02-05 close = 37.32, prior day 17.31
+#     https://cdn.cboe.com/resources/education/research_publications/after-the-volpocalypse-market-observation.pdf
+#   - FRED series VIXCLS (https://fred.stlouisfed.org/series/VIXCLS)
+#   - Macroption VIX historical record:
+#     2020-03-16 close = 82.69 (close-to-close +24.86 from prior day 57.83)
+#     https://www.macroption.com/vix-all-time-high/
 REFERENCE_VIX_CLOSE = {
-    "2018-02-02": 17.31,
-    "2018-02-05": 37.32,
-    "2020-03-13": 57.83,
-    "2020-03-16": 82.69,
+    "2018-02-02": 17.31,  # Volmageddon eve (Friday)
+    "2018-02-05": 37.32,  # Volmageddon (XIV blow-up Monday)
+    "2020-03-13": 57.83,  # Covid Friday
+    "2020-03-16": 82.69,  # Covid Monday — all-time VIX close high
 }
 
 
