@@ -779,14 +779,19 @@ def fetch_cboe_vix_historical():
         return {}
 
 
-def fetch_snapshots_2026(data_dir: str | None = None):
+def fetch_snapshots_2026(data_dir: str | None = None, year: int | None = 2023):
     """
-    Adapt OptionsDX local 2023 EOD data into the Supabase-style snapshot list
+    Adapt OptionsDX local EOD data into the Supabase-style snapshot list
     that main() / compute_vix_for_snapshot() consume.
 
     rfr convention: spx_local_loader.fetch_rfr returns DECIMAL (^IRX/100). The
     snapshot payload field "rfr" must be PERCENT, because main() does
     `rfr = float(payload["rfr"]) / 100.0`. We therefore multiply by 100 here.
+
+    `year`: if not None, restrict to QUOTE_DATE values whose calendar year
+    matches. Default 2023 preserves the historical pipeline behaviour
+    (pre-recursive-glob, only 2023 data was on disk). Pass None to load
+    every year present under data_dir.
 
     The imports of load_spx_options / fetch_rfr / fetch_vix_actual are
     function-local because spx_local_loader.py imports from this module at
@@ -799,6 +804,12 @@ def fetch_snapshots_2026(data_dir: str | None = None):
         data_dir = os.path.expanduser("~/data/spx_eod")
 
     chain = load_spx_options(data_dir=data_dir)
+    if year is not None:
+        chain = chain[chain["QUOTE_DATE"].dt.year == year].reset_index(drop=True)
+        if chain.empty:
+            raise ValueError(
+                f"No SPX EOD rows found for year={year} under {data_dir}."
+            )
     dates = sorted(chain["QUOTE_DATE"].unique())
     rfr_lookup = fetch_rfr(dates)
     vix_lookup = fetch_vix_actual(dates)
@@ -862,13 +873,20 @@ def main():
              "(moneyness, IV) curve before splining for the F3-F6 hybrid swap. "
              "0.0 disables smoothing.",
     )
+    parser.add_argument(
+        "--year", type=int, default=2023,
+        help="Calendar year to filter SPX EOD data to (default 2023). "
+             "Pass 0 to load every year present under the data dir.",
+    )
     args, _ = parser.parse_known_args()
     global HYBRID_SMOOTHING_SIGMA
     HYBRID_SMOOTHING_SIGMA = float(args.hybrid_smoothing)
-    print(f"Hybrid smoothing sigma: {HYBRID_SMOOTHING_SIGMA}\n")
+    year_filter = args.year if args.year and args.year > 0 else None
+    print(f"Hybrid smoothing sigma: {HYBRID_SMOOTHING_SIGMA}")
+    print(f"Year filter:            {year_filter if year_filter else 'ALL'}\n")
 
     print("Loading SPX EOD snapshots from local OptionsDX archive...")
-    snapshots = fetch_snapshots_2026()
+    snapshots = fetch_snapshots_2026(year=year_filter)
     print(f"  Retrieved {len(snapshots)} snapshots\n")
 
     if not snapshots:

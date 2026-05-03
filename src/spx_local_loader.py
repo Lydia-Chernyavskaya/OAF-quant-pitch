@@ -1,4 +1,5 @@
 import os
+import glob
 import yfinance as yf
 import pandas as pd
 
@@ -57,13 +58,30 @@ def fetch_vix_actual(dates):
     return {dt: get_vix(dt) for dt in dates}
 
 
-def load_spx_options(data_dir=None):
+def load_spx_options(data_dir=None, quote_dates=None):
+    """Load SPX EOD options data from text files.
+
+    `data_dir` may contain spx_eod_*.txt files directly (flat layout)
+    or organized into year subdirectories (e.g. data_dir/2023/...).
+    The recursive glob picks both up.
+
+    `quote_dates`: optional iterable of date strings ("YYYY-MM-DD") or
+    pd.Timestamps. When provided, the returned DataFrame is filtered
+    to only those QUOTE_DATE values — useful for event-study runs that
+    only need a handful of days. None (default) loads everything.
+    """
     if data_dir is None:
         data_dir = os.path.join(os.path.dirname(__file__), "data", "spx_eod")
-    files = sorted(f for f in os.listdir(data_dir) if f.endswith(".txt"))
+    pattern = os.path.join(data_dir, "**", "spx_eod_*.txt")
+    files = sorted(glob.glob(pattern, recursive=True))
+    if not files:
+        raise FileNotFoundError(
+            f"No SPX EOD .txt files found under {data_dir}. "
+            f"Expected files matching spx_eod_*.txt at any depth."
+        )
     dfs = []
     for f in files:
-        df = pd.read_csv(os.path.join(data_dir, f))
+        df = pd.read_csv(f)
         df.columns = [c.strip().strip("[]") for c in df.columns]
         for col in ["QUOTE_DATE", "EXPIRE_DATE"]:
             df[col] = df[col].str.strip()
@@ -72,5 +90,8 @@ def load_spx_options(data_dir=None):
     data = data[data["DTE"] > 0].reset_index(drop=True)
     data["QUOTE_DATE"] = pd.to_datetime(data["QUOTE_DATE"])
     data["EXPIRE_DATE"] = pd.to_datetime(data["EXPIRE_DATE"])
+    if quote_dates is not None:
+        target_dates = {pd.to_datetime(d).normalize() for d in quote_dates}
+        data = data[data["QUOTE_DATE"].dt.normalize().isin(target_dates)]
     data = data.sort_values(["QUOTE_DATE", "EXPIRE_DATE", "STRIKE"]).reset_index(drop=True)
     return data
