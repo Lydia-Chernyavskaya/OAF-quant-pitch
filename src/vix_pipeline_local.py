@@ -399,11 +399,26 @@ def build_30day_skew(df_near: pd.DataFrame, df_far: pd.DataFrame,
     """
     Build 30-day interpolated put and call skews from near/far expiry chains.
 
-    For each strike K in the union of near+far strikes:
-    1. Compute IV from option price at that strike for near-expiry
-    2. Compute IV from option price at that strike for far-expiry
-    3. Interpolate variance to 30-day: Var30(K) = w1*Var_near(K) + w2*Var_far(K)
-    4. Convert to vol: σ30(K) = √(Var30(K) × 365/30) × 100
+    Iterates the INTERSECTION of near and far strikes (exact match — no
+    nearest-strike fallback). The previous union+nearest-strike convention
+    polluted deep-OTM IVs whenever a strike existed in only one chain (the
+    other chain's nearest-strike IV is for a different K and corrupts the
+    smile, e.g. a K=700 deep-OTM put borrowing IV from a K=1700 row, which
+    rendered as a constant ~96% plateau).
+
+    Per-strike filters:
+      - Per-side zero-bid (Cboe spec)
+      - Mid <= 0 or NaN
+      - Mid < 0.05 (bid-floor noise: SPX EOD quotes round to 0.05 and
+        deep-OTM mids at the floor carry no σ information; bs_iv is
+        ambiguous in that regime)
+      - bs_iv solver failure
+      - Negative interpolated variance
+
+    For surviving strikes:
+      1. Compute IV from option price at that strike for both expiries
+      2. Interpolate variance to 30-day: Var30(K) = w1*Var_near + w2*Var_far
+      3. Convert to vol: σ30(K) = √(Var30(K) × 365/30) × 100
 
     Returns (put_skew_30d, call_skew_30d) where each is strike→vol dict.
     """
@@ -418,64 +433,57 @@ def build_30day_skew(df_near: pd.DataFrame, df_far: pd.DataFrame,
     # ATM strike for classification (use near-expiry ATM)
     K_atm_near = float(df_near.loc[(df_near["strike"] - spot).abs().idxmin(), "strike"])
 
-    # Union of all strikes
-    all_strikes = sorted(set(df_near["strike"].tolist()) | set(df_far["strike"].tolist()))
+    # Index by strike for O(1) lookup
+    near_by_K = {float(K): row for K, row in zip(df_near["strike"], df_near.to_dict("records"))}
+    far_by_K  = {float(K): row for K, row in zip(df_far["strike"],  df_far.to_dict("records"))}
+
+    # Intersection: strikes listed in BOTH chains. Exact strike match
+    # (no nearest-strike fallback) — see docstring.
+    common_strikes = sorted(set(near_by_K.keys()) & set(far_by_K.keys()))
 
     put_skew_30d = {}
     call_skew_30d = {}
 
-    for K in all_strikes:
+    MIN_MID = 0.05  # bid-floor threshold; mids <= this are noise
+
+    for K in common_strikes:
         if K <= 0:
             continue
 
         side_str = 'put' if K < K_atm_near else 'call'
         is_put_near = (side_str == 'put')
 
-        # ── Near-expiry: find nearest strike and compute IV ─────────────────
-        near_strikes = df_near["strike"].values
-        idx_near = np.argmin(np.abs(near_strikes - K))
-        K_near_nearest = near_strikes[idx_near]
-        near_row = df_near[df_near["strike"] == K_near_nearest].iloc[0]
+        near_row = near_by_K[K]
+        far_row  = far_by_K[K]
 
-        # Per-side validity: skip if relevant bid is zero
-        if _is_zero_bid(near_row.to_dict(), side_str):
+        # Per-side bid validity on both expiries
+        if _is_zero_bid(near_row, side_str) or _is_zero_bid(far_row, side_str):
             continue
-        price_near = float(near_row["pmid"] if side_str == 'put' else near_row["cmid"])
-        if math.isnan(price_near) or price_near <= 0:
+
+        price_near = float(near_row["pmid"] if is_put_near else near_row["cmid"])
+        price_far  = float(far_row["pmid"]  if is_put_near else far_row["cmid"])
+        if math.isnan(price_near) or math.isnan(price_far):
             continue
-        iv_near = bs_iv(price_near, F_near, K_near_nearest, T_near, rfr,
+        if price_near <= MIN_MID or price_far <= MIN_MID:
+            continue
+
+        iv_near = bs_iv(price_near, F_near, K, T_near, rfr,
                         is_call=not is_put_near)
         if iv_near <= 0:
             continue
-
-        # ── Far-expiry: find nearest strike and compute IV ──────────────────
-        far_strikes = df_far["strike"].values
-        idx_far = np.argmin(np.abs(far_strikes - K))
-        K_far_nearest = far_strikes[idx_far]
-        far_row = df_far[df_far["strike"] == K_far_nearest].iloc[0]
-
-        if _is_zero_bid(far_row.to_dict(), side_str):
-            continue
-        price_far = float(far_row["pmid"] if side_str == 'put' else far_row["cmid"])
-        if math.isnan(price_far) or price_far <= 0:
-            continue
-        iv_far = bs_iv(price_far, F_far, K_far_nearest, T_far, rfr,
+        iv_far = bs_iv(price_far, F_far, K, T_far, rfr,
                        is_call=not is_put_near)
         if iv_far <= 0:
             continue
 
-        # ── Variance interpolation ─────────────────────────────────────────
         var_near = (iv_near / 100.0) ** 2 * T_near
-        var_far = (iv_far / 100.0) ** 2 * T_far
+        var_far  = (iv_far  / 100.0) ** 2 * T_far
         var30 = w1 * var_near + w2 * var_far
-
         if var30 <= 0:
             continue
 
-        # Convert to 30-day vol (%)
         vol30 = math.sqrt(var30 / T30) * 100.0
 
-        # ── Classify into put vs call skew ─────────────────────────────────
         if K < K_atm_near:
             put_skew_30d[K] = vol30
         else:

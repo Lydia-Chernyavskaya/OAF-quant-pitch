@@ -211,8 +211,10 @@ def _plot_skew_panel(ax, t0_res: dict, t1_res: dict, t0_str: str, t1_str: str,
             ax.plot(ks, ys, lw=1.5, color=color, alpha=0.9, label=label, zorder=3)
 
     ax.set_yscale("log")
-    ax.set_yticks([32, 64, 96, 128])
-    ax.set_yticklabels(["32%", "64%", "96%", "128%"])
+    ax.set_yticks([16, 32, 64, 96, 128])
+    ax.set_yticklabels(["16%", "32%", "64%", "96%", "128%"])
+    ax.minorticks_off()       # suppress matplotlib's auto-generated minor ticks
+    ax.set_ylim(16, 130)      # pin to the visible range
     ax.set_xlabel("Strike")
     ax.set_ylabel("Implied Volatility")
     ax.set_title(title, fontsize=12, fontweight="bold")
