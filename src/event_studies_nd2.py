@@ -17,13 +17,11 @@ import sys
 import math
 from datetime import datetime
 
-import numpy as np
 import pandas as pd
 import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from scipy.interpolate import CubicSpline
 
 # Local imports — sibling modules in src/
 sys.path.insert(0, os.path.dirname(__file__))
@@ -189,8 +187,9 @@ def run_event(event: dict, data_dir: str, cboe_vix: dict) -> dict:
 
 def _plot_skew_panel(ax, t0_res: dict, t1_res: dict, t0_str: str, t1_str: str,
                      title: str):
-    """One panel of the skew chart: t0/t1 puts and calls scatter + spline,
-    log-y, fixed ticks at 32/64/96/128%."""
+    """One panel of the skew chart: t0/t1 puts and calls as scatter only
+    (CBOE Exhibit 17 style — dot density conveys the smile, no fitted line),
+    linear y-axis with ticks every 32 percentage points from 0% to 160%."""
     series = [
         (t0_res["put_skew_30d"],  f"Put {t0_str}",  "#1f4e79", 12),
         (t0_res["call_skew_30d"], f"Call {t0_str}", "#6699cc", 12),
@@ -202,19 +201,11 @@ def _plot_skew_panel(ax, t0_res: dict, t1_res: dict, t0_str: str, t1_str: str,
             continue
         ks = sorted(skew.keys())
         ys = [skew[k] for k in ks]
-        ax.scatter(ks, ys, s=msize, color=color, alpha=0.6, zorder=2)
-        if len(ks) >= 4:
-            cs = CubicSpline(ks, ys, bc_type="natural")
-            xs = np.linspace(ks[0], ks[-1], 400)
-            ax.plot(xs, cs(xs), lw=1.5, color=color, alpha=0.9, label=label, zorder=3)
-        else:
-            ax.plot(ks, ys, lw=1.5, color=color, alpha=0.9, label=label, zorder=3)
+        ax.scatter(ks, ys, s=msize, color=color, alpha=0.7, label=label, zorder=2)
 
-    ax.set_yscale("log")
-    ax.set_yticks([16, 32, 64, 96, 128])
-    ax.set_yticklabels(["16%", "32%", "64%", "96%", "128%"])
-    ax.minorticks_off()       # suppress matplotlib's auto-generated minor ticks
-    ax.set_ylim(16, 130)      # pin to the visible range
+    ax.set_yticks([0, 32, 64, 96, 128, 160])
+    ax.set_yticklabels(["0%", "32%", "64%", "96%", "128%", "160%"])
+    ax.set_ylim(0, 160)
     ax.set_xlabel("Strike")
     ax.set_ylabel("Implied Volatility")
     ax.set_title(title, fontsize=12, fontweight="bold")
