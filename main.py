@@ -62,6 +62,10 @@ def run_step4(surfaces: dict, vix_data: dict) -> pd.DataFrame:
     decomp = build_decomposition(surfaces, vix_data["vix_synthetic"])
     validate_decomposition(decomp)
     print_decomposition_table(decomp, n_rows=62)
+    out_csv = Path(__file__).parent / "src" / "output" / "vix_decomposition.csv"
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    decomp.to_csv(out_csv)
+    log.info("Wrote step-4 decomposition CSV → %s", out_csv)
     return decomp
 
 

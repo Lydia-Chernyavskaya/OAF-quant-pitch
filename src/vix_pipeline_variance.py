@@ -1,28 +1,61 @@
 #!/usr/bin/env python3
 """
-VIX Analysis (variance-space chain construction).
+VIX Analysis (variance-space strike-frame parallel counterfactuals).
 
-Sibling of vix_pipeline_local.py. Computes the same 6-factor VIX
-decomposition but as a sequential surface-construction chain in
-variance space, rather than parallel counterfactuals with
-vol-space scalar subtractions.
+Decomposes ΔVIX into six independent factors. Each factor is computed by
+applying ONLY that factor's surface change to t0's chain (not to a
+sequentially modified chain), recomputing VIX, and subtracting VIX_t0.
 
-    Σ_0 (t0 chain at t0 spot)
-     → Σ_1 (sticky strike: same chain at t1 spot)
-     → Σ_2 (parallel: every strike's variance bumped by Δvar_atm)
-     → Σ_3 (put shoulder: t1 IVs swapped on Σ_2)
-     → Σ_4 (call shoulder)
-     → Σ_5 (put wing)
-     → Σ_6 (call wing)
+  F1 sticky strike:   t0 chain repriced at F_new, IVs preserved (Derman).
+  F2 parallel shift:  t0 chain with σ² bumped by Δσ²_atm at every strike.
+  F3 put shoulder:    t0 chain with put-shoulder strikes' σ² replaced by
+                       level-controlled t1 σ² (σ_t1² − Δσ²_atm).
+  F4 call shoulder:   same on call shoulder.
+  F5 put wing:        same on put wing.
+  F6 call wing:       same on call wing.
 
-    F_k = VIX(Σ_k) − VIX(Σ_{k-1})  for k = 1..6
-    sum(F1..F6) = VIX_6 − VIX_0 ≈ ΔVIX
+  F_k = VIX(modified t0) − VIX(t0)   in VIX-pts.
 
-Output paths use the suffix "_variance" so this pipeline does not
-overwrite vix_pipeline_local.py's CSVs:
-    src/output/vix_decomposition_variance.csv
-    src/output/vix_decomposition_variance_local.csv
-    src/output/vix_decomposition_variance_chart.png
+Sum F1..F6 ≠ ΔVIX in general. Residual = interaction terms + belly bucket
+[-0.15, +0.15] not touched + non-bucketed strikes. The residual is honestly
+non-zero, not absorbed into F6 by telescoping construction.
+
+Methodology fixes vs prior vix_pipeline_variance.py:
+  - No telescoping error accumulating to F6 (each factor is independent).
+  - No frame mix between Derman F1 and moneyness F2-F6 (everything strike).
+  - No order-dependence (parallel counterfactuals).
+  - Variance-space throughout (σ² is the additive primitive).
+  - Unit-consistent: all factors in VIX-pts directly, no vol-pt-to-VIX-pt
+    conversion at any point.
+
+KNOWN CAVEATS
+- No cascade means F5 doesn't subtract F3, etc. On days where shoulder
+  AND wing both change, both F3 and F5 register the relevant variance
+  changes independently. Some "double-counting" appears in the residual
+  via the interaction term. This is correct given the parallel-
+  counterfactual framing — it's not a bug, it's the cost of the cleaner
+  no-cascade structure.
+- Belly bucket strikes with delta in [-0.15, +0.15] are not touched by
+  any F3-F6. Their share of the surface change goes entirely into the
+  residual. This is intentional (matches CBOE's bucket structure where
+  the belly is implicitly captured by F2).
+- Variance-space bump means at strikes already at high vol (deep-OTM puts
+  on a steep-skew day), the implicit per-strike vol-pt shift from F2 is
+  smaller than σ_t1(K_atmf) − σ_t0(K_atmf). At the ATM strike the shift
+  exactly matches a vol-pt parallel shift. This is the intended variance-
+  space behavior, not a deviation from "parallel."
+- Accordion handling at wings: a t1 bucket strike absent from t0's chain
+  gets a synthetic row appended in modified t0 with positive sentinel
+  bid/ask on both sides. Matches the CBOE bucket pipeline's handling.
+- N(d2) delta convention used throughout (matches the rest of the deck
+  pipelines).
+- F1/F2/F3-F6 are all in VIX-pts by construction (computed as VIX_modified
+  − VIX_t0). No mixed units, no vol-pt to VIX-pt linearization required.
+
+Output paths:
+    src/output/vix_decomposition_variance.csv          (main result CSV)
+    src/output/vix_decomposition_variance_local.csv    (full diagnostic CSV)
+    src/output/vix_decomposition_variance_chart.png    (per-factor plots)
 """
 
 from __future__ import annotations
@@ -40,15 +73,6 @@ from scipy.interpolate import CubicSpline
 from scipy.ndimage import gaussian_filter1d
 import scipy.stats as _ss  # _ss.norm used throughout; always available before any function def
 norm = _ss.norm  # module-level alias so functions can use norm directly
-
-# Module-level smoothing knob plumbed in from --hybrid-smoothing CLI arg.
-HYBRID_SMOOTHING_SIGMA = 0.0
-
-# Per-day intermediate diagnostics, keyed by curr["date"]. Populated by
-# run_decomposition so main() can print the worst-residual day's chain
-# values without changing run_decomposition's return type.
-CHAIN_DIAGNOSTICS: dict = {}
-
 
 @dataclass
 class VIXDecomposition:
@@ -114,24 +138,26 @@ def build_chain_df(optionchain_list: list) -> pd.DataFrame:
     df = df.sort_values("strike").reset_index(drop=True)
     return df
 
-def compute_forward(df: pd.DataFrame, spot: float, rfr: float, T: float) -> float:
+def compute_forward(df: pd.DataFrame, spot: float, rfr: float, T: float) -> tuple[float, float]:
     """Compute model-free forward price via put-call parity at ATM forward strike.
 
-    Finds K_atmf = strike minimizing |cmid - pmid| (model-free ATM),
-    then F = K_atmf + exp(rT) * (cmid - pmid).
+    Returns (F, K_atmf). K_atmf = strike minimizing |cmid - pmid| (model-free
+    ATM), then F = K_atmf + exp(rT) * (cmid - pmid). K_atmf is the same K0
+    anchor the VIX² formula uses internally for the (F/K0 − 1)² term; we
+    expose it so run_decomposition can read F1/F2 reference IVs there.
     """
     if "cmid" not in df.columns or "pmid" not in df.columns:
-        return spot
+        return (spot, spot)
     pc_diff = (df["cmid"] - df["pmid"]).abs()
     if pc_diff.empty:
-        return spot
+        return (spot, spot)
     idx = pc_diff.idxmin()
     K_atmf = float(df.loc[idx, "strike"])
     cmid = float(df.loc[idx, "cmid"])
     pmid = float(df.loc[idx, "pmid"])
     if math.isnan(cmid): cmid = 0.0
     if math.isnan(pmid): pmid = 0.0
-    return K_atmf + math.exp(rfr * T) * (cmid - pmid)
+    return (K_atmf + math.exp(rfr * T) * (cmid - pmid), K_atmf)
 
 def _is_zero_bid(row, side: str) -> bool:
     """Cboe per-side zero-bid check.
@@ -236,16 +262,18 @@ def get_strikes_in_delta_bucket(
     upper_excl: bool = False,
 ) -> set[float]:
     """
-    Return strikes whose N(d1) delta falls in the [delta_lo, delta_hi]
-    interval (boundary inclusivity controlled by lower_excl / upper_excl).
+    N(d2) variant — uses risk-neutral probability of ITM rather than
+    BS delta. Bucket thresholds retain their numerical values; strike
+    coverage shifts vs the N(d1) version. Matches the rest of the deck
+    pipelines (vix_pipeline_local_nd2, vix_pipeline_CBOE_bucket_nd2).
 
     For each strike K in chain_df:
-      1. Use bs_iv to get sigma from the option price (pmid for puts, cmid for calls)
-      2. Compute d1 = (ln(spot/K) + 0.5*sigma²*T) / (sigma*sqrt(T))
-      3. delta = N(d1) - 1 for puts, N(d1) for calls
-      4. Filter to the chosen interval. Per-side bid validity: skip
-         strikes whose relevant-side bid is zero (Cboe spec — no
-         cross-side fallback).
+      1. bs_iv to get sigma from the option price (pmid for puts, cmid for calls)
+      2. d1 = (ln(spot/K) + 0.5*σ²*T) / (σ*sqrt(T))
+         d2 = d1 - σ*sqrt(T)
+      3. delta = N(d2) - 1 for puts, N(d2) for calls
+      4. Filter to [delta_lo, delta_hi]. Per-side zero-bid filter: skip
+         strikes whose relevant-side bid is zero.
 
     Returns set of strikes in the delta bucket.
     """
@@ -273,10 +301,11 @@ def get_strikes_in_delta_bucket(
 
         sigma = sigma_iv / 100.0
         d1 = (math.log(spot / K) + 0.5 * sigma ** 2 * T) / (sigma * sqrt_T)
+        d2 = d1 - sigma * sqrt_T
         if side == 'put':
-            delta_val = norm.cdf(d1) - 1.0
+            delta_val = norm.cdf(d2) - 1.0
         else:
-            delta_val = norm.cdf(d1)
+            delta_val = norm.cdf(d2)
 
         lo_ok = (delta_val > delta_lo) if lower_excl else (delta_val >= delta_lo)
         hi_ok = (delta_val < delta_hi) if upper_excl else (delta_val <= delta_hi)
@@ -364,8 +393,11 @@ def compute_vix_for_snapshot(spot: float, rfr: float,
     K_atm2 = float(df2.loc[(df2["strike"] - spot).abs().idxmin(), "strike"])
 
     # ── Forward prices ──────────────────────────────────────────────────────
-    F1 = compute_forward(df1, K_atm1, rfr, T1)
-    F2 = compute_forward(df2, K_atm2, rfr, T2)
+    # F1, F2 are forward PRICES (not the F1/F2 decomposition factors).
+    # K_atmf1/K_atmf2 are the model-free ATM strikes (|cmid−pmid| min) used
+    # for run_decomposition's F1/F2 IV reads.
+    F1, K_atmf1 = compute_forward(df1, K_atm1, rfr, T1)
+    F2, K_atmf2 = compute_forward(df2, K_atm2, rfr, T2)
 
     # ── Compute FULL CBOE variance for each expiry ─────────────────────────
     var1, _, _ = compute_vix_variance(df1, F1, rfr, T1)
@@ -403,6 +435,8 @@ def compute_vix_for_snapshot(spot: float, rfr: float,
         "rfr": rfr,
         "K_atm1": K_atm1,
         "K_atm2": K_atm2,
+        "K_atmf_near": K_atmf1,
+        "K_atmf_far":  K_atmf2,
         "chain1_df": df1,
         "chain2_df": df2,
         "F": F1,
@@ -505,23 +539,33 @@ def build_30day_skew(df_near: pd.DataFrame, df_far: pd.DataFrame,
     return put_skew_30d, call_skew_30d
 
 def get_vol_at_strike(skew_dict: dict[float, float], target_strike: float) -> float:
-    """
-    Cubic spline interpolation of vol at target_strike from a skew dict (strike→vol).
-    Returns edge values if target is outside the strike range.
+    """Nearest-strike lookup. Matches the CBOE bucket pipeline's convention
+    and avoids spline artifacts on noisy wings. Returns 0.0 if skew_dict is
+    empty.
     """
     if not skew_dict:
         return 0.0
-    strikes = sorted(skew_dict.keys())
-    vols = [skew_dict[k] for k in strikes]
+    nearest_K = min(skew_dict.keys(), key=lambda K: abs(K - target_strike))
+    return float(skew_dict[nearest_K])
 
-    if target_strike <= strikes[0]:
-        return vols[0]
-    if target_strike >= strikes[-1]:
-        return vols[-1]
 
-    # Fit cubic spline and evaluate at target strike
-    cs = CubicSpline(strikes, vols, bc_type="natural")
-    return float(cs(target_strike))
+def _interp_iv_at_strike(skew_dict: dict[float, float], K: float) -> float | None:
+    """Linear interpolation of vol at K from skew dict. Returns None if K
+    is outside the dict's strike span. Used for accordion fallback when a
+    bucket strike isn't listed in t0's skew."""
+    if not skew_dict:
+        return None
+    if K in skew_dict:
+        return float(skew_dict[K])
+    sorted_K = sorted(skew_dict.keys())
+    if K < sorted_K[0] or K > sorted_K[-1]:
+        return None
+    lo = max(k for k in sorted_K if k <= K)
+    hi = min(k for k in sorted_K if k >= K)
+    if lo == hi:
+        return float(skew_dict[lo])
+    w = (K - lo) / (hi - lo)
+    return float(skew_dict[lo]) * (1.0 - w) + float(skew_dict[hi]) * w
 
 def _signed_delta(K: float, S: float, vol30: float, T30: float, side: str) -> float:
     """Signed delta using N(d1): put = N(d1) - 1, call = N(d1)."""
@@ -600,111 +644,11 @@ def apply_uniform_variance_bump(df, F, T, r, var_bump_annual):
     return out
 
 
-def apply_bucket_swap(df, bucket_strikes, t1_iv_spline,
-                      F, T, r, side, k_lo, k_hi):
-    """Overwrite mids at bucket_strikes using t1's IV looked up at
-    log-moneyness k_t0 = ln(K / F), BS-priced under t0's frame
-    (F, T, r).
-
-    The t1 spline is parameterized in t1-frame log-moneyness
-    (k_t1 = ln(K_t1 / F_t1)); we evaluate it at the t0-frame
-    log-moneyness of each t0 strike. That asks "what was t1's IV
-    at the same point on the moneyness axis where t0 has strike K".
-
-    No level-shift adjustment — the caller has already applied any
-    parallel/shoulder shift to the input chain.
-
-    side='put'  updates pmid via _bs_put.
-    side='call' updates cmid via _bs_call.
-    Strikes whose k_t0 falls outside [k_lo, k_hi] are left alone.
-    """
-
-    out = df.copy()
-    if side == "put":
-        bs_price = _bs_put
-        mid_col  = "pmid"
-    else:
-        bs_price = _bs_call
-        mid_col  = "cmid"
-
-    for K in bucket_strikes:
-        if K <= 0:
-            continue
-        k_t0 = math.log(K / F)
-        if k_t0 < k_lo or k_t0 > k_hi:
-            continue
-        iv = float(t1_iv_spline(k_t0))
-        if iv <= 0 or not np.isfinite(iv):
-            continue
-        sigma = iv / 100.0
-        new_price = bs_price(F, K, T, sigma, r)
-        if not np.isfinite(new_price) or new_price <= 0:
-            continue
-        out.loc[out["strike"] == K, mid_col] = new_price
-    return out
-
-
-def apply_uniform_iv_shift(df, F, T, r, delta_iv_pct):
-    """Uniform Δσ in vol-pt space.
-
-    For every strike K and each side (call, put):
-      1. Imply σ_K from the current mid via bs_iv (returns IV in
-         percent, e.g. 18.5).
-      2. Shift: σ_K_new = σ_K + delta_iv_pct (still in percent).
-      3. BS-reprice under (F, T, r) with sigma = σ_K_new / 100.
-      4. Overwrite the mid.
-
-    Strikes whose IV cannot be implied (NaN mid, IV solver fails)
-    are left unchanged. Strikes whose shifted IV would be ≤ 0 are
-    also left unchanged.
-
-    This is distinct from apply_uniform_variance_bump: the bump is
-    σ + Δσ, not σ² + Δσ². The chain's variance change is therefore
-    strike-dependent (because (σ+Δσ)² − σ² = 2σΔσ + Δσ²); that's
-    intentional — Cboe's parallel-shift convention is in vol-pt
-    space, not variance space.
-    """
-    out = df.copy()
-    for i, row in out.iterrows():
-        K = float(row["strike"])
-        if K <= 0:
-            continue
-
-        for side, mid_col, pricer in [
-            ("call", "cmid", _bs_call),
-            ("put",  "pmid", _bs_put),
-        ]:
-            mid = float(row.get(mid_col, float("nan")))
-            if math.isnan(mid) or mid <= 0:
-                continue
-            iv_pct = bs_iv(mid, F, K, T, r,
-                           is_call=(side == "call"))
-            if iv_pct <= 0:
-                continue
-            iv_new_pct = iv_pct + delta_iv_pct
-            if iv_new_pct <= 0:
-                continue
-            new_price = pricer(F, K, T, iv_new_pct / 100.0, r)
-            if np.isfinite(new_price) and new_price > 0:
-                out.at[i, mid_col] = new_price
-    return out
-
-
-def reprice_chain_at_new_spot(df, F_old, F_new, T, r):
-    """Σ_1 helper — literal sticky strike via chain reprice.
-
-    For every strike K and each side (call, put):
-      1. Imply σ_K from the current mid under F_old via bs_iv.
-      2. If σ_K cannot be implied (NaN mid, solver fails), leave
-         the mid alone.
-      3. BS-reprice under F_new at the SAME σ_K, T, r.
-      4. Overwrite the mid.
-
-    Result: IVs at every strike are exactly preserved from t0 (this
-    is the literal Derman sticky-strike rule). Mids now encode F_new
-    instead of F_old, so the chain is put-call-parity-consistent
-    with F_new. Subsequent IV implies and reprices in F_new's frame
-    will round-trip cleanly.
+def reprice_at_new_forward(df, F_old, F_new, T, r):
+    """Derman sticky-strike chain reprice. For every strike K, imply σ_K
+    from t0's mid under F_old, then BS-reprice under F_new at the same
+    σ_K. IVs preserved exactly; mids now encode F_new and round-trip
+    cleanly under F_new's frame. Used for F1 (sticky strike).
     """
     out = df.copy()
     for i, row in out.iterrows():
@@ -718,304 +662,226 @@ def reprice_chain_at_new_spot(df, F_old, F_new, T, r):
             mid = float(row.get(mid_col, float("nan")))
             if math.isnan(mid) or mid <= 0:
                 continue
-            iv_pct = bs_iv(mid, F_old, K, T, r,
-                           is_call=(side == "call"))
+            iv_pct = bs_iv(mid, F_old, K, T, r, is_call=(side == "call"))
             if iv_pct <= 0:
                 continue
-            sigma = iv_pct / 100.0
-            new_price = pricer(F_new, K, T, sigma, r)
+            new_price = pricer(F_new, K, T, iv_pct / 100.0, r)
             if np.isfinite(new_price) and new_price > 0:
                 out.at[i, mid_col] = new_price
     return out
 
 
-def apply_bucket_swap_logmoneyness(df, bucket_strikes, t1_iv_spline,
-                                   F, T, r, side, m_lo_t1, m_hi_t1):
-    """Replace bucket strikes' relevant-side IVs with t1's IV at the
-    same forward-anchored log-moneyness.
-
-    For each strike K in bucket_strikes:
-      1. k = ln(K / F).  F is the chain's current frame (F_new).
-      2. If k is outside [m_lo_t1, m_hi_t1]: skip (out of spline support).
-      3. new_iv_pct = t1_iv_spline(k). If <= 0 or non-finite, skip.
-      4. BS-reprice the side's option at K under (F, T, r) with
-         sigma = new_iv_pct / 100.
-      5. If finite and positive, overwrite pmid (put) or cmid (call).
-
-    The t1 spline is parameterized in t1-frame log-moneyness
-    (k_t1 = ln(K_t1 / F_t1)); we query it at the chain's
-    forward-anchored log-moneyness for each strike. Since F_new ≈
-    F_t1 (same spot, tiny drift), the query is very close to "what
-    was t1's IV at exactly this strike's moneyness".
+def compute_factor_bucket_variance(prev: dict, curr: dict,
+                                   delta_lo: float, delta_hi: float,
+                                   side: str,
+                                   delta_var_atm: float,
+                                   lower_excl: bool = False,
+                                   upper_excl: bool = False) -> float:
     """
-    out = df.copy()
-    if side == "put":
-        bs_price = _bs_put
-        mid_col  = "pmid"
-    else:
-        bs_price = _bs_call
-        mid_col  = "cmid"
+    Variance-space, parallel-counterfactual bucket recomputation.
 
-    for K in bucket_strikes:
-        if K <= 0:
+    1. Build level-controlled t1 surface: σ_t1_lvl²(K) = σ_t1²(K) − Δσ²_atm
+       (annualized σ², decimal vol²). Skip K if non-positive.
+    2. Identify bucket on t1's near chain at signed delta range
+       [delta_lo, delta_hi] using N(d2).
+    3. Take t0's chain. For each bucket strike K with σ_t1_lvl(K) defined,
+       BS-reprice both pmid AND cmid under t0's frame using σ_t1_lvl(K).
+       Both sides patched under PCP so compute_vix_variance picks up the
+       patch regardless of which side of t0's K0 the strike falls on.
+    4. Accordion: a t1 bucket strike absent from t0's chain gets a synthetic
+       row with positive sentinel bid/ask on both sides at the BS-priced
+       mids.
+    5. Recompute VIX. Return VIX_modified − prev["vix_computed"].
+
+    Arguments:
+      delta_lo, delta_hi: signed bucket bounds on t1.
+      side: 'put' for F3/F5, 'call' for F4/F6.
+      delta_var_atm: scalar Δσ²_atm = σ_t1²(K_atmf_new) − σ_t0²(K_atmf_new),
+        in (vol-decimal)² units. Subtracted from σ_t1²(K) at every K to
+        remove the parallel level shift.
+      lower_excl, upper_excl: bucket boundary inclusivity.
+
+    No cascade. Each factor is its own independent counterfactual on t0.
+    Returns F_k = VIX_modified − VIX_t0 in VIX-pts.
+    """
+    F_old     = prev["F"]
+    F_far_old = prev["F2"]
+    T1        = prev["T1"]
+    T2        = prev["T2"]
+    r         = prev["rfr"]
+
+    combined_old = {**prev.get("put_skew_30d", {}), **prev.get("call_skew_30d", {})}
+    combined_new = {**curr.get("put_skew_30d", {}), **curr.get("call_skew_30d", {})}
+    if not combined_old or not combined_new:
+        return 0.0
+
+    bucket = get_strikes_in_delta_bucket(
+        curr["chain1_df"], curr["spot"], curr["T1"], curr["rfr"],
+        delta_lo=delta_lo, delta_hi=delta_hi, side=side,
+        lower_excl=lower_excl, upper_excl=upper_excl,
+    )
+    if not bucket:
+        return 0.0
+
+    # Build patches: level-controlled t1 vols → BS prices under t0's frame
+    patches_near: dict[float, tuple[float, float]] = {}
+    patches_far:  dict[float, tuple[float, float]] = {}
+    for K in sorted(bucket):
+        K_f = float(K)
+
+        sigma_t1_pct = combined_new.get(K_f)
+        if sigma_t1_pct is None:
+            sigma_t1_pct = _interp_iv_at_strike(combined_new, K_f)
+        if sigma_t1_pct is None:
             continue
-        k = math.log(K / F)
-        if k < m_lo_t1 or k > m_hi_t1:
+
+        sigma_t1 = float(sigma_t1_pct) / 100.0
+        sigma_t1_lvl_sq = sigma_t1 ** 2 - delta_var_atm
+        if sigma_t1_lvl_sq <= 0 or not np.isfinite(sigma_t1_lvl_sq):
             continue
-        iv_pct = float(t1_iv_spline(k))
-        if iv_pct <= 0 or not np.isfinite(iv_pct):
-            continue
-        sigma = iv_pct / 100.0
-        new_price = bs_price(F, K, T, sigma, r)
-        if not np.isfinite(new_price) or new_price <= 0:
-            continue
-        out.loc[out["strike"] == K, mid_col] = new_price
-    return out
+        sigma_eff = math.sqrt(sigma_t1_lvl_sq)
+
+        new_put_near  = _bs_put( F_old,     K_f, T1, sigma_eff, r)
+        new_call_near = _bs_call(F_old,     K_f, T1, sigma_eff, r)
+        new_put_far   = _bs_put( F_far_old, K_f, T2, sigma_eff, r)
+        new_call_far  = _bs_call(F_far_old, K_f, T2, sigma_eff, r)
+
+        if (np.isfinite(new_put_near) and new_put_near > 0
+                and np.isfinite(new_call_near) and new_call_near > 0):
+            patches_near[K_f] = (float(new_put_near), float(new_call_near))
+        if (np.isfinite(new_put_far) and new_put_far > 0
+                and np.isfinite(new_call_far) and new_call_far > 0):
+            patches_far[K_f]  = (float(new_put_far), float(new_call_far))
+
+    if not patches_near and not patches_far:
+        return 0.0
+
+    def _patched(df_orig: pd.DataFrame,
+                 patches: dict[float, tuple[float, float]]) -> pd.DataFrame:
+        df = df_orig.copy()
+        existing_strikes = set(df["strike"].astype(float))
+        synth_rows = []
+        for K, (put_price, call_price) in patches.items():
+            if K in existing_strikes:
+                df.loc[df["strike"] == K, "pmid"] = put_price
+                df.loc[df["strike"] == K, "cmid"] = call_price
+            else:
+                synth = {
+                    "strike": K,
+                    "pmid": put_price, "cmid": call_price,
+                    "pbid": max(put_price * 0.95, 0.05),
+                    "pask": put_price * 1.05,
+                    "cbid": max(call_price * 0.95, 0.05),
+                    "cask": call_price * 1.05,
+                }
+                synth_rows.append(synth)
+        if synth_rows:
+            df = pd.concat([df, pd.DataFrame(synth_rows)], ignore_index=True)
+            df = df.sort_values("strike").reset_index(drop=True)
+        return df
+
+    df_near_patched = _patched(prev["chain1_df"], patches_near)
+    df_far_patched  = _patched(prev["chain2_df"], patches_far)
+
+    vix_modified = compute_vix_from_chains(
+        df_near_patched, df_far_patched,
+        F_old, F_far_old, T1, T2, r,
+    )
+    if vix_modified is None:
+        return 0.0
+    return vix_modified - prev["vix_computed"]
 
 
 def run_decomposition(prev: dict, curr: dict) -> VIXDecomposition | None:
     """
-    Sequential variance-space chain (parity-clean F_new frame from F1 on).
+    Strike-space, variance-additive, parallel-counterfactual decomposition.
 
-    F1 implements Derman sticky-strike literally — every t0 IV
-    preserved, mids BS-repriced under F_new for parity consistency,
-    VIX recomputed under new K₀ and F_new. F2-F6 modify the
-    resulting parity-clean chain in F_new's frame: F2 applies a
-    uniform IV shift equal to the moneyness-aligned ATM IV change;
-    F3-F6 replace each component's IVs with t1's IV at the same
-    forward-anchored log-moneyness. All BS reprices and variance
-    integrals from VIX_1 onward use F_new for self-consistency.
+    Each factor is an independent counterfactual on t0's chain — no
+    cascade, no telescoping, no order-dependence. All operations work on
+    annualized σ² (variance-space). All returned factor values are in
+    VIX-pts (VIX_modified − VIX_t0).
 
-        Σ_0  t0 chain at t0 spot, F_old                       → VIX_0
-        Σ_1  Σ_0 with every strike repriced under F_new at
-             preserved IVs (Derman sticky strike)             → F1
-        Σ_2  Σ_1 with uniform IV shift +ΔIV_atm               → F2
-        Σ_3  Σ_2 with put-shoulder t1-IV swap                 → F3
-        Σ_4  Σ_3 with call-shoulder t1-IV swap                → F4
-        Σ_5  Σ_4 with put-wing t1-IV swap                     → F5
-        Σ_6  Σ_5 with call-wing t1-IV swap                    → F6
+      F1 sticky strike: reprice t0's chain at F_new keeping IVs fixed.
+      F2 parallel:      bump every strike's σ² by Δσ²_atm.
+      F3 put shoulder:  replace bucket strikes' σ² with level-controlled t1
+                         (signed delta [-0.45, -0.15) on t1).
+      F4 call shoulder: same on (0.15, 0.45].
+      F5 put wing:      same on [-0.15, -0.01).
+      F6 call wing:     same on (0.01, 0.15].
 
-    Sum F1..F6 telescopes to VIX_6 − VIX_0 modulo float epsilon.
-    Residual to ΔVIX_actual reflects only the belly-shape gap
-    (strikes between −0.15 and +0.15 delta whose t1 IV differs from
-    t0 IV beyond the parallel shift).
-
-    Conventions:
-      - Log-moneyness k = ln(K / F). After F1, the chain frame is
-        F_new — every IV imply, BS reprice, and bucket-swap lookup
-        uses F_new (and F_far_new for the far chain).
-      - ΔIV_atm = t1_spline(0) − t0_spline(0), where t0 spline is
-        parameterized by k_t0 = ln(K / F_old) and t1 spline by
-        k_t1 = ln(K / F_t1). Moneyness-aligned, NOT strike-aligned
-        (deliberate departure from CBOE whitepaper p18 for
-        self-consistency with the moneyness-space pipeline).
-      - Bucket-swap lookups for F3-F6: for each strike K in the
-        post-F1 chain, compute k = ln(K / F_new) and evaluate
-        t1_iv_spline(k) — no ΔIV_atm subtraction. The returned IV
-        becomes the new σ_K directly.
-
-    Bucket boundaries (Cboe whitepaper Exhibit 11):
-        F3 put shoulder      delta in [-.45, -.15)
-        F4 call shoulder     delta in ( .15,  .45]
-        F5 put wing          delta in [-.15, -.01)
-        F6 call wing         delta in ( .01,  .15]
-
-    Bucket strikes are identified on each step's INPUT chain
-    (df1_2 for Σ_3, df1_3 for Σ_4, etc.); bucket classification uses
-    S_new because the chain frame is F_new.
+    Sum F1..F6 ≠ ΔVIX in general. Residual captures: (a) interaction
+    terms across the six counterfactual changes, (b) belly bucket
+    [-0.15, +0.15] never touched, (c) any non-bucketed strikes.
     """
     put_old  = prev.get("put_skew_30d", {})
     put_new  = curr.get("put_skew_30d", {})
     call_old = prev.get("call_skew_30d", {})
     call_new = curr.get("call_skew_30d", {})
-
     if not put_old or not put_new or not call_old or not call_new:
         return None
 
-    S_old = prev["spot"]
-    S_new = curr["spot"]
+    VIX_t0 = prev["vix_computed"]
     F_old      = prev["F"]
     F_far_old  = prev["F2"]
-    F_t1       = curr["F"]
+    F_t1_near  = curr["F"]
+    F_t1_far   = curr["F2"]
     T1 = prev["T1"]
     T2 = prev["T2"]
     r  = prev["rfr"]
-    df1 = prev["chain1_df"]
-    df2 = prev["chain2_df"]
 
-    # ── Σ_0 baseline ──────────────────────────────────────────────
-    VIX_0 = prev["vix_computed"]
+    # ── F1 sticky strike: reprice t0's chain at F_new, IVs preserved ──
+    df1_near_F1 = reprice_at_new_forward(prev["chain1_df"], F_old, F_t1_near, T1, r)
+    df1_far_F1  = reprice_at_new_forward(prev["chain2_df"], F_far_old, F_t1_far, T2, r)
+    vix_F1 = compute_vix_from_chains(df1_near_F1, df1_far_F1,
+                                     F_t1_near, F_t1_far, T1, T2, r)
+    F1 = (vix_F1 - VIX_t0) if vix_F1 is not None else 0.0
 
-    # ── Σ_1 sticky strike with chain reprice (parity-clean) ──────
-    # For every strike: imply σ from the t0 mid under F_old, then
-    # BS-reprice under F_new at the same σ. IVs preserved exactly;
-    # mids now encode F_new. Subsequent IV implies in F_new's frame
-    # round-trip cleanly.
-    spot_ratio  = S_new / S_old
-    F_new_S_new = F_old * spot_ratio
-    F_far_S_new = F_far_old * spot_ratio
-
-    df1_1 = reprice_chain_at_new_spot(df1, F_old, F_new_S_new, T1, r)
-    df2_1 = reprice_chain_at_new_spot(df2, F_far_old, F_far_S_new, T2, r)
-
-    VIX_1 = compute_vix_from_chains(df1_1, df2_1,
-                                    F_new_S_new, F_far_S_new,
-                                    T1, T2, r)
-    if VIX_1 is None:
-        VIX_1 = VIX_0
-    F1 = VIX_1 - VIX_0
-
-    # ── Build t0 and t1 IV-vs-log-moneyness splines ──────────────
-    t0_full_skew = {**put_old, **call_old}
-    t1_full_skew = {**put_new, **call_new}
-
-    def _build_logm_spline(skew_dict, F):
-        sorted_K = sorted(K for K in skew_dict if K > 0)
-        if len(sorted_K) < 4:
-            return None, None, None
-        k_arr = np.array([math.log(K / F) for K in sorted_K])
-        iv_arr = np.array([skew_dict[K] for K in sorted_K], dtype=float)
-        if HYBRID_SMOOTHING_SIGMA and HYBRID_SMOOTHING_SIGMA > 0:
-            iv_arr = gaussian_filter1d(iv_arr,
-                                       sigma=float(HYBRID_SMOOTHING_SIGMA))
-        return (CubicSpline(k_arr, iv_arr, bc_type="natural"),
-                float(k_arr[0]), float(k_arr[-1]))
-
-    t0_iv_spline, m_lo_t0, m_hi_t0 = _build_logm_spline(t0_full_skew, F_old)
-    t1_iv_spline, m_lo_t1, m_hi_t1 = _build_logm_spline(t1_full_skew, F_t1)
-
-    if t0_iv_spline is None or t1_iv_spline is None:
-        VIX_actual_old = prev.get("vix_actual") or VIX_0
-        VIX_actual_new = curr.get("vix_actual") or curr.get("vix_computed", 0.0)
-        return VIXDecomposition(
-            total_vix_change=VIX_actual_new - VIX_actual_old,
-            factor1_sticky_strike=F1,
-            factor2_parallel_shift=0.0,
-            factor3_put_skew_grad=0.0,
-            factor4_call_skew_grad=0.0,
-            factor5_downside_conv=0.0,
-            factor6_upside_conv=0.0,
-        )
-
-    # ── Σ_2 parallel shift in vol-pt space (under F_new) ─────────
-    delta_iv_pct = float(t1_iv_spline(0.0) - t0_iv_spline(0.0))
-
-    df1_2 = apply_uniform_iv_shift(df1_1, F_new_S_new, T1, r, delta_iv_pct)
-    df2_2 = apply_uniform_iv_shift(df2_1, F_far_S_new, T2, r, delta_iv_pct)
-
-    VIX_2 = compute_vix_from_chains(df1_2, df2_2,
-                                    F_new_S_new, F_far_S_new,
-                                    T1, T2, r)
-    if VIX_2 is None:
-        VIX_2 = VIX_1
-        F2 = 0.0
+    # ── Δσ²_atm scalar (annualized variance gap at K_atmf_new) ────────
+    K_atmf_new = float(curr["K_atmf_near"])
+    combined_old = {**put_old, **call_old}
+    combined_new = {**put_new, **call_new}
+    sigma_t0_atm_pct = get_vol_at_strike(combined_old, K_atmf_new)
+    sigma_t1_atm_pct = get_vol_at_strike(combined_new, K_atmf_new)
+    if sigma_t0_atm_pct <= 0 or sigma_t1_atm_pct <= 0:
+        # Cannot compute Δσ²_atm; F2-F6 zero.
+        delta_var_atm = 0.0
     else:
-        F2 = VIX_2 - VIX_1
+        sigma_t0_atm = sigma_t0_atm_pct / 100.0
+        sigma_t1_atm = sigma_t1_atm_pct / 100.0
+        delta_var_atm = sigma_t1_atm ** 2 - sigma_t0_atm ** 2
 
-    # ── Σ_3 put shoulder: [-0.45, -0.15)  (under F_new) ─────────
-    ps_strikes = get_strikes_in_delta_bucket(
-        df1_2, S_new, T1, r,
+    # ── F2 parallel shift in variance space ──────────────────────────
+    df1_near_F2 = apply_uniform_variance_bump(
+        prev["chain1_df"], F_old,     T1, r, delta_var_atm)
+    df1_far_F2  = apply_uniform_variance_bump(
+        prev["chain2_df"], F_far_old, T2, r, delta_var_atm)
+    vix_F2 = compute_vix_from_chains(df1_near_F2, df1_far_F2,
+                                     F_old, F_far_old, T1, T2, r)
+    F2 = (vix_F2 - VIX_t0) if vix_F2 is not None else 0.0
+
+    # ── F3-F6 bucket replacements (level-controlled, parallel) ───────
+    F3 = compute_factor_bucket_variance(
+        prev, curr,
         delta_lo=-0.45, delta_hi=-0.15, side="put",
-        lower_excl=False, upper_excl=True,
-    )
-    df1_3 = apply_bucket_swap_logmoneyness(df1_2, ps_strikes, t1_iv_spline,
-                                           F_new_S_new, T1, r, "put",
-                                           m_lo_t1, m_hi_t1)
-    df2_3 = apply_bucket_swap_logmoneyness(df2_2, ps_strikes, t1_iv_spline,
-                                           F_far_S_new, T2, r, "put",
-                                           m_lo_t1, m_hi_t1)
-    VIX_3 = compute_vix_from_chains(df1_3, df2_3,
-                                    F_new_S_new, F_far_S_new,
-                                    T1, T2, r)
-    if VIX_3 is None:
-        VIX_3 = VIX_2
-        F3 = 0.0
-    else:
-        F3 = VIX_3 - VIX_2
-
-    # ── Σ_4 call shoulder: (0.15, 0.45]  (under F_new) ──────────
-    cs_strikes = get_strikes_in_delta_bucket(
-        df1_3, S_new, T1, r,
-        delta_lo=0.15, delta_hi=0.45, side="call",
-        lower_excl=True, upper_excl=False,
-    )
-    df1_4 = apply_bucket_swap_logmoneyness(df1_3, cs_strikes, t1_iv_spline,
-                                           F_new_S_new, T1, r, "call",
-                                           m_lo_t1, m_hi_t1)
-    df2_4 = apply_bucket_swap_logmoneyness(df2_3, cs_strikes, t1_iv_spline,
-                                           F_far_S_new, T2, r, "call",
-                                           m_lo_t1, m_hi_t1)
-    VIX_4 = compute_vix_from_chains(df1_4, df2_4,
-                                    F_new_S_new, F_far_S_new,
-                                    T1, T2, r)
-    if VIX_4 is None:
-        VIX_4 = VIX_3
-        F4 = 0.0
-    else:
-        F4 = VIX_4 - VIX_3
-
-    # ── Σ_5 put wing: [-0.15, -0.01)  (under F_new) ─────────────
-    pw_strikes = get_strikes_in_delta_bucket(
-        df1_4, S_new, T1, r,
+        delta_var_atm=delta_var_atm,
+        lower_excl=False, upper_excl=True)
+    F4 = compute_factor_bucket_variance(
+        prev, curr,
+        delta_lo=+0.15, delta_hi=+0.45, side="call",
+        delta_var_atm=delta_var_atm,
+        lower_excl=True,  upper_excl=False)
+    F5 = compute_factor_bucket_variance(
+        prev, curr,
         delta_lo=-0.15, delta_hi=-0.01, side="put",
-        lower_excl=False, upper_excl=True,
-    )
-    df1_5 = apply_bucket_swap_logmoneyness(df1_4, pw_strikes, t1_iv_spline,
-                                           F_new_S_new, T1, r, "put",
-                                           m_lo_t1, m_hi_t1)
-    df2_5 = apply_bucket_swap_logmoneyness(df2_4, pw_strikes, t1_iv_spline,
-                                           F_far_S_new, T2, r, "put",
-                                           m_lo_t1, m_hi_t1)
-    VIX_5 = compute_vix_from_chains(df1_5, df2_5,
-                                    F_new_S_new, F_far_S_new,
-                                    T1, T2, r)
-    if VIX_5 is None:
-        VIX_5 = VIX_4
-        F5 = 0.0
-    else:
-        F5 = VIX_5 - VIX_4
+        delta_var_atm=delta_var_atm,
+        lower_excl=False, upper_excl=True)
+    F6 = compute_factor_bucket_variance(
+        prev, curr,
+        delta_lo=+0.01, delta_hi=+0.15, side="call",
+        delta_var_atm=delta_var_atm,
+        lower_excl=True,  upper_excl=False)
 
-    # ── Σ_6 call wing: (0.01, 0.15]  (under F_new) ──────────────
-    cw_strikes = get_strikes_in_delta_bucket(
-        df1_5, S_new, T1, r,
-        delta_lo=0.01, delta_hi=0.15, side="call",
-        lower_excl=True, upper_excl=False,
-    )
-    df1_6 = apply_bucket_swap_logmoneyness(df1_5, cw_strikes, t1_iv_spline,
-                                           F_new_S_new, T1, r, "call",
-                                           m_lo_t1, m_hi_t1)
-    df2_6 = apply_bucket_swap_logmoneyness(df2_5, cw_strikes, t1_iv_spline,
-                                           F_far_S_new, T2, r, "call",
-                                           m_lo_t1, m_hi_t1)
-    VIX_6 = compute_vix_from_chains(df1_6, df2_6,
-                                    F_new_S_new, F_far_S_new,
-                                    T1, T2, r)
-    if VIX_6 is None:
-        VIX_6 = VIX_5
-        F6 = 0.0
-    else:
-        F6 = VIX_6 - VIX_5
-
-    # ── Cache chain values for residual diagnostics ───────────────
-    CHAIN_DIAGNOSTICS[curr.get("date", "?")] = {
-        "VIX_0": VIX_0, "VIX_1": VIX_1, "VIX_2": VIX_2,
-        "VIX_3": VIX_3, "VIX_4": VIX_4,
-        "VIX_5": VIX_5, "VIX_6": VIX_6,
-        "delta_iv_pct": delta_iv_pct,
-        "F_old": F_old, "F_new_S_new": F_new_S_new,
-        "F_far_old": F_far_old, "F_far_S_new": F_far_S_new,
-        "F_t1": F_t1,
-        "S_old": S_old, "S_new": S_new,
-        "k0_t0_at_F_old":  math.log(prev["K_atm1"] / F_old)
-            if prev.get("K_atm1") and F_old > 0 else float("nan"),
-        "t0_spline_at_0": float(t0_iv_spline(0.0)),
-        "t1_spline_at_0": float(t1_iv_spline(0.0)),
-        "k_lo_t1": m_lo_t1, "k_hi_t1": m_hi_t1,
-        "k_lo_t0": m_lo_t0, "k_hi_t0": m_hi_t0,
-    }
-
-    # ── Ground truth ──────────────────────────────────────────────
-    VIX_actual_old = prev.get("vix_actual") or VIX_0
+    VIX_actual_old = prev.get("vix_actual") or VIX_t0
     VIX_actual_new = curr.get("vix_actual") or curr.get("vix_computed", 0.0)
     total = VIX_actual_new - VIX_actual_old
 
@@ -1154,10 +1020,10 @@ def main():
              "Pass 0 to load every year present under the data dir.",
     )
     args, _ = parser.parse_known_args()
-    global HYBRID_SMOOTHING_SIGMA
-    HYBRID_SMOOTHING_SIGMA = float(args.hybrid_smoothing)
+    # --hybrid-smoothing is deprecated and has no effect on this pipeline;
+    # kept only for CLI backward-compat with the hybrid pipeline.
+    _ = float(args.hybrid_smoothing)
     year_filter = args.year if args.year and args.year > 0 else None
-    print(f"Hybrid smoothing sigma: {HYBRID_SMOOTHING_SIGMA}")
     print(f"Year filter:            {year_filter if year_filter else 'ALL'}\n")
 
     print("Loading SPX EOD snapshots from local OptionsDX archive...")
@@ -1287,7 +1153,7 @@ def main():
             "residual": residual,
         })
 
-    # ── Hybrid summary stats + CSV ─────────────────────────────────────────
+    # ── Variance parallel-counterfactual summary ──────────────────────────
     if residual_rows:
         resid_arr = np.array([r["residual"] for r in residual_rows])
         f3_arr = np.array([r["F3"] for r in residual_rows])
@@ -1295,52 +1161,16 @@ def main():
         f5_arr = np.array([r["F5"] for r in residual_rows])
         f6_arr = np.array([r["F6"] for r in residual_rows])
         print("\n" + "=" * 70)
-        print(f"VARIANCE-CHAIN SUMMARY (smoothing_sigma={HYBRID_SMOOTHING_SIGMA})")
+        print("VARIANCE PARALLEL-COUNTERFACTUAL SUMMARY")
         print("=" * 70)
         print(f"  N days:            {len(residual_rows)}")
         print(f"  mean(residual):    {resid_arr.mean():+.4f}")
         print(f"  std(residual):     {resid_arr.std(ddof=0):.4f}")
         print(f"  max|residual|:     {np.abs(resid_arr).max():.4f}")
-        print(f"  mean(F3_hybrid):   {f3_arr.mean():+.4f}")
-        print(f"  mean(F4_hybrid):   {f4_arr.mean():+.4f}")
-        print(f"  mean(F5_hybrid):   {f5_arr.mean():+.4f}")
-        print(f"  mean(F6_hybrid):   {f6_arr.mean():+.4f}")
-
-        # ── Worst-residual day diagnostic ───────────────────────────
-        # TODO(variance-chain): worst-residual day below repeatedly
-        # exposes the F1 K₀-parity approximation interacting with a
-        # large ΔIV_atm. Until F1 gets a chain-reprice path (out of
-        # scope per spec), residuals on big-ΔIV days will run > 1.5.
-        worst_idx = int(np.argmax(np.abs(resid_arr)))
-        worst_row = residual_rows[worst_idx]
-        worst_date = worst_row["date"]
-        diag = CHAIN_DIAGNOSTICS.get(worst_date, {})
-        print()
-        print(f"WORST-RESIDUAL DAY: {worst_date}  residual={worst_row['residual']:+.4f}")
-        print("-" * 70)
-        print(f"  ΔVIX_actual: {worst_row['d_vix_actual']:+.4f}   "
-              f"sum(F1..F6): {worst_row['sum']:+.4f}")
-        print(f"  F1={worst_row['F1']:+.4f}  F2={worst_row['F2']:+.4f}  "
-              f"F3={worst_row['F3']:+.4f}  F4={worst_row['F4']:+.4f}  "
-              f"F5={worst_row['F5']:+.4f}  F6={worst_row['F6']:+.4f}")
-        if diag:
-            print(f"  VIX chain: 0={diag['VIX_0']:.4f}  1={diag['VIX_1']:.4f}  "
-                  f"2={diag['VIX_2']:.4f}  3={diag['VIX_3']:.4f}  "
-                  f"4={diag['VIX_4']:.4f}  5={diag['VIX_5']:.4f}  "
-                  f"6={diag['VIX_6']:.4f}")
-            print(f"  ΔIV_atm (vol-pt): {diag['delta_iv_pct']:+.4f}")
-            print(f"  S_old={diag['S_old']:.2f}  S_new={diag['S_new']:.2f}  "
-                  f"(dSPX_pct={(diag['S_new']/diag['S_old']-1)*100:+.3f}%)")
-            print(f"  F_old (near)={diag['F_old']:.4f}  "
-                  f"F_new_S_new={diag['F_new_S_new']:.4f}")
-            print(f"  F_far_old={diag['F_far_old']:.4f}  "
-                  f"F_far_S_new={diag['F_far_S_new']:.4f}")
-            print(f"  F_t1 (curr near)={diag['F_t1']:.4f}")
-            print(f"  k0_t0 (at F_old)={diag['k0_t0_at_F_old']:+.5f}")
-            print(f"  t0_spline(0)={diag['t0_spline_at_0']:.4f}  "
-                  f"t1_spline(0)={diag['t1_spline_at_0']:.4f}")
-            print(f"  t1 spline k range: [{diag['k_lo_t1']:+.4f}, "
-                  f"{diag['k_hi_t1']:+.4f}]")
+        print(f"  mean(F3):          {f3_arr.mean():+.4f}")
+        print(f"  mean(F4):          {f4_arr.mean():+.4f}")
+        print(f"  mean(F5):          {f5_arr.mean():+.4f}")
+        print(f"  mean(F6):          {f6_arr.mean():+.4f}")
 
     # Write hybrid CSV
     output_dir_hybrid = os.path.join(os.path.dirname(__file__), "output")
@@ -1542,19 +1372,30 @@ def main():
 
         f.write("\n## Column Descriptions\n")
         f.write("- VIX_Computed: 30-day constant-maturity VIX using 2-expiry linear interpolation\n")
-        f.write("- F1 (Sticky Strike):     ATM vol change from SPX spot move holding skew fixed\n")
-        f.write("- F2 (Parallel Shift):    Full surface level change at same strike\n")
-        f.write("- F3 (Put Skew Gradient): Put shoulder (30-delta) change net of F2\n")
-        f.write("- F4 (Call Skew Gradient):Call shoulder (30-delta) change net of F2\n")
-        f.write("- F5 (Downside Convexity):Put wing (10-delta) convexity change net of F2+F3\n")
-        f.write("- F6 (Upside Convexity):  Call wing (10-delta) convexity change net of F2+F4\n")
+        f.write("- F1 (Sticky Strike):     VIX-pt impact of repricing t0's chain at F_new (Derman)\n")
+        f.write("- F2 (Parallel Shift):    VIX-pt impact of bumping every t0 strike's σ² by Δσ²_atm\n")
+        f.write("- F3 (Put Skew Gradient): VIX-pt impact of patching t0 put-shoulder strikes' σ²\n")
+        f.write("                          with level-controlled t1 σ² (independent of F2)\n")
+        f.write("- F4 (Call Skew Gradient):Same on call shoulder (independent of F2/F3)\n")
+        f.write("- F5 (Downside Convexity):Same on put wing (independent of F2/F3)\n")
+        f.write("- F6 (Upside Convexity):  Same on call wing (independent of F2/F4)\n")
         f.write("- VIX_Actual:             CBOE published VIX (or payload VIX spot where available)\n")
         f.write("\n## Methodology Notes\n")
-        f.write("- F1-F6 use SINGLE-STRIKE representative approximation (30-delta put/call, 10-delta put/call)\n")
-        f.write("  Full F3 requires VIX recomputed after adjusting ALL 15-45 delta put prices\n")
-        f.write("  Full F5 requires VIX recomputed after adjusting ALL 1-15 delta put prices\n")
-        f.write("- Delta-to-strike: iterative approach using actual IV from near-term skew at each strike\n")
-        f.write("- F1 = OLD_30d_put_vol_at_NEW_spot - OLD_ATM_vol (per whitepaper P13)\n")
+        f.write("- Strike-space, variance-additive, parallel-counterfactual decomposition.\n")
+        f.write("  Each factor is an independent counterfactual on t0's chain — no cascade,\n")
+        f.write("  no telescoping, no order-dependence. All operations work on annualized σ²\n")
+        f.write("  (variance-space). F_k = VIX(modified t0) − VIX(t0) in VIX-pts directly.\n")
+        f.write("- F1 sticky strike: t0 chain repriced at F_new keeping IVs fixed (Derman).\n")
+        f.write("- F2 parallel:      t0 chain with σ² bumped by Δσ²_atm at every strike,\n")
+        f.write("                    where Δσ²_atm = σ_t1²(K_atmf_new) − σ_t0²(K_atmf_new).\n")
+        f.write("- F3-F6: t0 chain with bucket strikes' σ² replaced by level-controlled t1 σ²\n")
+        f.write("        (σ_t1² − Δσ²_atm). Buckets defined by signed N(d2) delta on t1's chain.\n")
+        f.write("- Sum F1..F6 ≠ ΔVIX in general. Residual = interaction terms + belly bucket\n")
+        f.write("  [-0.15, +0.15] not touched + non-bucketed strikes. Honestly non-zero, not\n")
+        f.write("  absorbed into F6 by telescoping construction.\n")
+        f.write("- N(d2) delta convention. K_atmf is the model-free ATM strike (|cmid-pmid| min).\n")
+        f.write("- Accordion: t1 bucket strikes absent from t0's chain get synthetic rows with\n")
+        f.write("  positive sentinel bid/ask on both sides at the BS-priced mids.\n")
 
     print(f"\nResults saved to {output_path}")
 
